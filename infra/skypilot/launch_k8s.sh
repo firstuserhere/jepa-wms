@@ -201,7 +201,7 @@ launch_env=()
 
 # `p1` is the exact case-sensitive Enterprise priority class exposed here.
 launch_command=(
-  "$sky_executable" jobs launch "$rendered_task" --priority p1
+  "$sky_executable" jobs launch "$rendered_task" --priority p1 -y -d
   --git-url "$git_url" --git-ref "$git_ref" --workspace "$sky_workspace"
 )
 # macOS ships Bash 3.2, where expanding an empty array under `set -u` raises
