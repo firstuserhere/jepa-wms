@@ -1,4 +1,11 @@
+from pathlib import Path
+
+import yaml
+
 from infra.skypilot.render_k8s_task import render_k8s_task
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _base_task():
@@ -62,3 +69,12 @@ def test_k8s_profile_rejects_missing_or_unsafe_volume_names():
         assert "DNS-style" in str(error)
     else:
         raise AssertionError("unsafe DROID volume was accepted")
+
+
+def test_droid_staging_uses_queue_friendly_network_bound_resources():
+    task = yaml.safe_load(
+        (REPO_ROOT / "infra/skypilot/droid_stage.yaml").read_text(encoding="utf-8")
+    )
+
+    assert task["resources"]["cpus"] == "16+"
+    assert task["resources"]["memory"] == "64+"

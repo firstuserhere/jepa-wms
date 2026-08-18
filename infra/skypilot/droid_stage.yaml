@@ -3,8 +3,10 @@ num_nodes: 1
 
 resources:
   cloud: gcp
-  cpus: 64+
-  memory: 256+
+  # Staging is network/shared-filesystem bound.  Keep the pod small enough to
+  # fit while the H200 pool is busy; gsutil still parallelizes across 16 CPUs.
+  cpus: 16+
+  memory: 64+
   disk_size: 512
   disk_tier: best
   use_spot: true
