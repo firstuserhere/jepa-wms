@@ -63,6 +63,10 @@ infra/skypilot/launch_k8s.sh stage-dinov3 \
   --dinov3-weights-sha256 "$DINOV3_SHA256" \
   --git-url "$GIT_URL" --git-ref "$GIT_REF" --workspace "$SKY_WORKSPACE"
 
+infra/skypilot/launch_k8s.sh stage-released \
+  --checkpoint-volume "$CHECKPOINT_VOLUME" \
+  --git-url "$GIT_URL" --git-ref "$GIT_REF" --workspace "$SKY_WORKSPACE"
+
 infra/skypilot/launch_k8s.sh distributed-smoke \
   --run-id "$DISTRIBUTED_SMOKE_RUN_ID" \
   --checkpoint-volume "$CHECKPOINT_VOLUME" \
@@ -96,6 +100,9 @@ infra/skypilot/launch_k8s.sh full \
 the 8 TiB PVC and publishes its fully verified manifest only after checking
 every episode. `stage-dinov3` downloads the private URL quietly, validates the
 full checksum, and atomically publishes the artifact into the checkpoint PVC.
+`stage-released` downloads Meta's pinned DROID world-model release once through
+the managed HF identity, verifies its full SHA-256, and atomically publishes it
+for all qualification nodes.
 Training copies that verified artifact into each node's local source tree.
 
 Add `--dry-run` to any Kubernetes command to render its provider/storage

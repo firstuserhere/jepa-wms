@@ -6,7 +6,7 @@ usage() {
   echo "       [--run-id ID [--resume]] [--distributed-smoke-run-id ID]" >&2
   echo "       [--qualification-run-id ID] [--runtime-readiness-run-id ID]" >&2
   echo "       [--git-url URL --git-ref COMMIT] [--priority p0|p1|p2|p3|p4] [--dry-run]" >&2
-  echo "MODE: preflight | stage | stage-dinov3 | distributed-smoke | qualify | train-smoke | full" >&2
+  echo "MODE: preflight | stage | stage-dinov3 | stage-released | distributed-smoke | qualify | train-smoke | full" >&2
 }
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -109,6 +109,10 @@ case "$mode" in
     task_spec=infra/skypilot/dinov3_stage_k8s.yaml
     [[ -n "$checkpoint_volume" ]] || { echo "--checkpoint-volume is required" >&2; exit 2; }
     validate_dinov3_sha
+    ;;
+  stage-released)
+    task_spec=infra/skypilot/released_droid_stage_k8s.yaml
+    [[ -n "$checkpoint_volume" ]] || { echo "--checkpoint-volume is required" >&2; exit 2; }
     ;;
   distributed-smoke)
     task_spec=infra/skypilot/distributed_smoke.yaml

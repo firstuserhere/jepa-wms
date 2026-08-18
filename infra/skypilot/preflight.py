@@ -132,6 +132,10 @@ def validate_tasks() -> None:
         raise AssertionError("Released JEPA-WM Hub revision is not pinned")
     if "daa69198aef764932f1cb809239a4e19c71da20a93c6a0b9f3869cb30a13f4aa" not in qualify_run:
         raise AssertionError("Released DROID checkpoint SHA-256 is not pinned")
+    if "hf download facebook/jepa-wms" in qualify_run:
+        raise AssertionError("Qualification must consume the pre-staged immutable released checkpoint")
+    if "$JEPAWM_CKPT/artifacts/releases/jepa_wm_droid-${release_sha256}.pth.tar" not in qualify_run:
+        raise AssertionError("Qualification does not consume the shared released-checkpoint artifact")
 
 
 def validate_kubernetes_profile() -> None:
@@ -171,6 +175,24 @@ def validate_kubernetes_profile() -> None:
     if dinov3_rendered.get("secrets") != ["secrets:DINOV3_WEIGHTS_URL"]:
         raise AssertionError("Native DINOv3 staging URL must remain a managed secret")
     sky.Task.from_yaml_config(copy.deepcopy(dinov3_rendered))
+
+    released_stage = yaml.safe_load(
+        (INFRA_DIR / "released_droid_stage_k8s.yaml").read_text(encoding="utf-8")
+    )
+    released_rendered = render_k8s_task(
+        released_stage,
+        droid_volume=None,
+        checkpoint_volume="jepawm-checkpoints-test",
+        context="Skypilot",
+    )
+    if released_rendered.get("secrets") != ["secrets:HF_TOKEN"]:
+        raise AssertionError("Released DROID staging must use only the managed HF token")
+    released_run = released_rendered.get("run", "")
+    if "9b9c41ef249466630dbf1a20e78391865d07b3b9" not in released_run:
+        raise AssertionError("Released DROID staging Hub revision is not pinned")
+    if "daa69198aef764932f1cb809239a4e19c71da20a93c6a0b9f3869cb30a13f4aa" not in released_run:
+        raise AssertionError("Released DROID staging checksum is not pinned")
+    sky.Task.from_yaml_config(copy.deepcopy(released_rendered))
 
     expected_volumes = {
         "droid_raw_k8s.yaml": ("8Ti", "ReadWriteMany"),
@@ -280,7 +302,7 @@ def validate_local_syntax() -> None:
     scripts = sorted(INFRA_DIR.glob("*.sh"))
     for script in scripts:
         subprocess.run(["bash", "-n", str(script)], check=True)
-    for filename in (*TASK_FILES, "dinov3_stage_k8s.yaml"):
+    for filename in (*TASK_FILES, "dinov3_stage_k8s.yaml", "released_droid_stage_k8s.yaml"):
         document = yaml.safe_load((INFRA_DIR / filename).read_text(encoding="utf-8"))
         for block_name in ("setup", "run"):
             block = document.get(block_name)

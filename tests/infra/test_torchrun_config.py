@@ -190,6 +190,23 @@ def test_qualification_task_publishes_receipt_after_planning():
 
     assert run.rindex("qualification_receipt.py publish") > run.index("--master_port=29601")
     assert "--planning-wandb-run-id-file" in run
+    assert "hf download facebook/jepa-wms" not in run
+    assert "$JEPAWM_CKPT/artifacts/releases/jepa_wm_droid-${release_sha256}.pth.tar" in run
+
+
+def test_released_checkpoint_stage_is_pinned_and_atomic():
+    import yaml
+
+    task = yaml.safe_load(
+        (REPO_ROOT / "infra/skypilot/released_droid_stage_k8s.yaml").read_text(encoding="utf-8")
+    )
+    run = task["run"]
+
+    assert task["secrets"] == ["secrets:HF_TOKEN"]
+    assert "9b9c41ef249466630dbf1a20e78391865d07b3b9" in run
+    assert "daa69198aef764932f1cb809239a4e19c71da20a93c6a0b9f3869cb30a13f4aa" in run
+    assert 'mv "$temporary" "$destination"' in run
+    assert 'git status --porcelain=v1 --untracked-files=all' in run
 
 
 def test_runtime_smokes_publish_two_node_recovery_evidence():

@@ -83,44 +83,29 @@ run: |
   test -d "$JEPAWM_DSET/droid_raw/1.0.1"
   test -d "$JEPAWM_DSET/franka_custom"
 
+  readonly release_name=jepa_wm_droid.pth.tar
+  readonly release_revision=9b9c41ef249466630dbf1a20e78391865d07b3b9
+  readonly release_sha256=daa69198aef764932f1cb809239a4e19c71da20a93c6a0b9f3869cb30a13f4aa
+  staged_release="$JEPAWM_CKPT/artifacts/releases/jepa_wm_droid-${release_sha256}.pth.tar"
+  test -s "$staged_release"
+  test "$(sha256sum "$staged_release" | awk '{print $1}')" = "$release_sha256"
+  test "$(awk '{print $1}' "$staged_release.sha256")" = "$release_sha256"
+  test "$(tr -d '\r\n' < "$staged_release.huggingface_revision.txt")" = "$release_revision"
+
+  # Copy once per node so eight local ranks do not independently stream the
+  # 2.7 GB model from the shared filesystem during torch.load.
   release_cache="$PWD/.artifacts/releases"
-  release_dir="$JEPAWM_CKPT/qualification/released_artifact"
-  release_name=jepa_wm_droid.pth.tar
-  readonly release_expected_sha256=daa69198aef764932f1cb809239a4e19c71da20a93c6a0b9f3869cb30a13f4aa
-  mkdir -p "$release_cache" "$release_dir"
-  uv run --no-sync hf download facebook/jepa-wms "$release_name" \
-    --revision 9b9c41ef249466630dbf1a20e78391865d07b3b9 \
-    --local-dir "$release_cache"
-  release_sha256="$(sha256sum "$release_cache/$release_name" | awk '{print $1}')"
-  if [[ "$release_sha256" != "$release_expected_sha256" ]]; then
-    echo "Released DROID checkpoint checksum mismatch at pinned Hub revision" >&2
-    exit 2
+  mkdir -p "$release_cache"
+  local_release="$release_cache/$release_name"
+  local_sha256=""
+  [[ ! -f "$local_release" ]] || local_sha256="$(sha256sum "$local_release" | awk '{print $1}')"
+  if [[ "$local_sha256" != "$release_sha256" ]]; then
+    temporary_release="$release_cache/.${release_name}.${SKYPILOT_TASK_ID}.tmp"
+    cp "$staged_release" "$temporary_release"
+    test "$(sha256sum "$temporary_release" | awk '{print $1}')" = "$release_sha256"
+    mv "$temporary_release" "$local_release"
   fi
-  target_checkpoint="$release_dir/jepa_wm_droid-${release_sha256}.pth.tar"
-  target_checksum_file="$target_checkpoint.sha256"
-  if [[ "$SKYPILOT_NODE_RANK" == 0 ]]; then
-    target_sha256=""
-    [[ ! -f "$target_checkpoint" ]] || target_sha256="$(sha256sum "$target_checkpoint" | awk '{print $1}')"
-    if [[ "$target_sha256" != "$release_sha256" ]]; then
-      temporary_checkpoint="$release_dir/.jepa_wm_droid.${SKYPILOT_TASK_ID}.node-0.tmp"
-      cp "$release_cache/$release_name" "$temporary_checkpoint"
-      sync "$temporary_checkpoint"
-      test "$(sha256sum "$temporary_checkpoint" | awk '{print $1}')" = "$release_sha256"
-      mv -f "$temporary_checkpoint" "$target_checkpoint"
-    fi
-    temporary_checksum="$release_dir/.jepa_wm_droid.${SKYPILOT_TASK_ID}.sha256.tmp"
-    printf '%s  %s\n' "$release_sha256" "$(basename "$target_checkpoint")" > "$temporary_checksum"
-    sync "$temporary_checksum"
-    mv -f "$temporary_checksum" "$target_checksum_file"
-    temporary_revision="$release_dir/.huggingface_revision.${SKYPILOT_TASK_ID}.tmp"
-    printf '%s\n' 9b9c41ef249466630dbf1a20e78391865d07b3b9 > "$temporary_revision"
-    sync "$temporary_revision"
-    mv -f "$temporary_revision" "$release_dir/huggingface_revision.txt"
-  fi
-  # Every node loads its already verified local Hub cache. Rank zero alone
-  # archives an immutable durable copy; this avoids concurrent 2.7 GB writes
-  # and does not require a fragile filesystem polling barrier before torchrun.
-  export RELEASED_DROID_CHECKPOINT_PATH="$release_cache/$release_name"
+  export RELEASED_DROID_CHECKPOINT_PATH="$local_release"
 
   master_addr="$(printf '%s\n' "$SKYPILOT_NODE_IPS" | sed -n '1p')"
   test -n "$master_addr"
