@@ -5,7 +5,7 @@ usage() {
   echo "Usage: $0 MODE [stores] [--dinov3-weights-uri gs://URI --dinov3-weights-sha256 HEX]" >&2
   echo "       [--run-id ID [--resume]] [--distributed-smoke-run-id ID]" >&2
   echo "       [--qualification-run-id ID] [--runtime-readiness-run-id ID]" >&2
-  echo "       [--git-url URL --git-ref COMMIT --workspace NAME] [--dry-run]" >&2
+  echo "       [--git-url URL --git-ref COMMIT --workspace NAME] [--priority p0|p1|p2|p3|p4] [--dry-run]" >&2
   echo "MODE: preflight | stage | distributed-smoke | train-smoke | qualify | full" >&2
 }
 
@@ -33,6 +33,7 @@ dry_run=0
 git_url=""
 git_ref=""
 sky_workspace=""
+priority_class="p1"
 while (($#)); do
   case "$1" in
     --checkpoint-store)
@@ -85,6 +86,10 @@ while (($#)); do
       ;;
     --workspace)
       sky_workspace="${2:-}"
+      shift 2
+      ;;
+    --priority)
+      priority_class="${2:-}"
       shift 2
       ;;
     -h|--help)
@@ -152,6 +157,10 @@ if [[ -n "$runtime_readiness_run_id" ]] && [[ ! "$runtime_readiness_run_id" =~ ^
 fi
 if ((resume_requested)) && [[ -z "$run_id" ]]; then
   echo "--resume requires an explicit --run-id for intentional continuation" >&2
+  exit 2
+fi
+if [[ ! "$priority_class" =~ ^p[0-4]$ ]]; then
+  echo "--priority must be one of the case-sensitive Enterprise classes p0, p1, p2, p3, or p4" >&2
   exit 2
 fi
 
@@ -264,9 +273,8 @@ if [[ ! -x "$sky_executable" ]]; then
   sky_executable="$(command -v sky)"
 fi
 
-# P1 intentionally remains a launch-time priority class rather than being
-# hidden in task YAML.  This Enterprise workspace defines class names in
-# lowercase, so `p1` is the exact accepted spelling of the P1 class.
-exec "$sky_executable" jobs launch "$task_spec" --priority p1 \
+# Priority intentionally remains a launch-time setting rather than being
+# hidden in task YAML. Use p1 first; callers may explicitly escalate to p0.
+exec "$sky_executable" jobs launch "$task_spec" --priority "$priority_class" \
   --git-url "$git_url" --git-ref "$git_ref" --workspace "$sky_workspace" \
   "${launch_env[@]}"

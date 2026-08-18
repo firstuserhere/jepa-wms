@@ -23,7 +23,7 @@ The connected Enterprise API currently exposes Kubernetes compute in the
 `default`, `cpu`, and `fellows` workspaces; it does not expose GCP compute.
 The `Skypilot` Kubernetes context advertises H200 nodes with 1/2/4/8 GPUs per
 node and 128 H200s total. Availability is dynamic (the read-only check on
-2026-08-15 reported zero free), so the explicit `p1` launch priority is what
+2026-08-15 reported zero free), so the default explicit `p1` launch priority is what
 queues/bids for capacity. Do not use the GCP profile below unless `sky check`
 later confirms GCP in the selected workspace.
 
@@ -164,9 +164,10 @@ are rejected. `setup_training.sh` verifies the remote checkout is exactly that
 commit and clean; schema-v2 checkpoints then embed the commit, status, complete
 dirty patch (empty for these clean launches), and patch checksum.
 
-Every actual submission contains the explicit CLI flag `--priority p1` (the
-case-sensitive spelling of the P1 class in this SkyPilot Enterprise
-workspace). The YAML files deliberately contain no priority setting. `HF_TOKEN` and
+Every actual submission contains an explicit CLI priority. The launcher defaults
+to `--priority p1` (the case-sensitive spelling in this SkyPilot Enterprise
+workspace), which can displace `p2` work. Escalation is deliberate via
+`--priority p0`; the YAML files contain no hidden priority setting. `HF_TOKEN` and
 `WANDB_API_KEY` are managed SkyPilot secret references; this bundle never
 accepts their values on the command line. The Hugging Face identity behind
 `HF_TOKEN` must already have accepted the DINOv3 license.

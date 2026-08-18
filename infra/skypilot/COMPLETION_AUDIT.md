@@ -45,7 +45,7 @@ managed recovery work on the target cluster.
 5. Pass the two-node NCCL/W&B/managed-recovery smoke.
 6. Pass released checkpoint rollout and planning qualification.
 7. Pass the two-node real DROID gradient/save/restart/resume smoke.
-8. Only then submit the 4×8 H200 matched run with explicit `p1` priority.
+8. Only then submit the 4×8 H200 matched run with explicit `p1` priority; escalate to `p0` only if `p1` cannot secure the required capacity.
 
 Any failed step is a no-go for the next expensive step; it is not converted
 into a warning or silently bypassed.

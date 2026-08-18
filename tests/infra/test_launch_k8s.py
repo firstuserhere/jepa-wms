@@ -63,3 +63,27 @@ printf '%s\\n' "$@" > "$JEPAWM_TEST_SKY_LOG"
     assert "-y" in arguments
     assert "-d" in arguments
     assert "--env" not in arguments
+
+    subprocess.run(
+        [
+            "bash",
+            str(REPO_ROOT / "infra/skypilot/launch_k8s.sh"),
+            "stage",
+            "--droid-volume",
+            "firstuserhere-jepawm-droid",
+            "--priority",
+            "p0",
+            "--git-url",
+            "https://github.com/firstuserhere/jepa-wms.git",
+            "--git-ref",
+            "f1e6237a74b99d007cac6590deabce087ea00059",
+            "--workspace",
+            "default",
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=True,
+    )
+    escalated_arguments = invocation_log.read_text(encoding="utf-8").splitlines()
+    priority_index = escalated_arguments.index("--priority")
+    assert escalated_arguments[priority_index + 1] == "p0"

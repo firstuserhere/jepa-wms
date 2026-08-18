@@ -5,7 +5,7 @@ usage() {
   echo "Usage: $0 MODE --workspace NAME [volume options] [artifact options]" >&2
   echo "       [--run-id ID [--resume]] [--distributed-smoke-run-id ID]" >&2
   echo "       [--qualification-run-id ID] [--runtime-readiness-run-id ID]" >&2
-  echo "       [--git-url URL --git-ref COMMIT] [--dry-run]" >&2
+  echo "       [--git-url URL --git-ref COMMIT] [--priority p0|p1|p2|p3|p4] [--dry-run]" >&2
   echo "MODE: preflight | stage | stage-dinov3 | distributed-smoke | qualify | train-smoke | full" >&2
 }
 
@@ -31,6 +31,7 @@ git_url=""
 git_ref=""
 sky_workspace=""
 k8s_context="Skypilot"
+priority_class="p1"
 while (($#)); do
   case "$1" in
     --droid-volume) droid_volume="${2:-}"; shift 2 ;;
@@ -46,6 +47,7 @@ while (($#)); do
     --git-ref) git_ref="${2:-}"; shift 2 ;;
     --workspace) sky_workspace="${2:-}"; shift 2 ;;
     --k8s-context) k8s_context="${2:-}"; shift 2 ;;
+    --priority) priority_class="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
   esac
@@ -143,6 +145,10 @@ if [[ ! "$k8s_context" =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$ ]]; then
   echo "--k8s-context is invalid" >&2
   exit 2
 fi
+if [[ ! "$priority_class" =~ ^p[0-4]$ ]]; then
+  echo "--priority must be one of the case-sensitive Enterprise classes p0, p1, p2, p3, or p4" >&2
+  exit 2
+fi
 
 rendered_task="$(mktemp "${TMPDIR:-/tmp}/jepawm-k8s-task.XXXXXX.yaml")"
 trap 'rm -f "$rendered_task"' EXIT
@@ -199,9 +205,10 @@ launch_env=()
 [[ -z "$runtime_readiness_run_id" ]] || launch_env+=(--env "JEPAWM_RUNTIME_READINESS_RUN_ID=$runtime_readiness_run_id")
 ((resume_requested == 0)) || launch_env+=(--env "JEPAWM_RESUME=1")
 
-# `p1` is the exact case-sensitive Enterprise priority class exposed here.
+# Use p1 first so this run can displace p2 work without taking p0 capacity.
+# Callers may explicitly escalate to p0 if p1 cannot secure enough H200s.
 launch_command=(
-  "$sky_executable" jobs launch "$rendered_task" --priority p1 -y -d
+  "$sky_executable" jobs launch "$rendered_task" --priority "$priority_class" -y -d
   --git-url "$git_url" --git-ref "$git_ref" --workspace "$sky_workspace"
 )
 # macOS ships Bash 3.2, where expanding an empty array under `set -u` raises

@@ -50,7 +50,7 @@ def validate_tasks() -> None:
         task_path = INFRA_DIR / filename
         document = yaml.safe_load(task_path.read_text(encoding="utf-8"))
         if "priority" in document or "priority_class" in document:
-            raise AssertionError(f"{filename}: P1 must remain an explicit launch CLI flag")
+            raise AssertionError(f"{filename}: priority must remain an explicit launch CLI flag")
         resources = document["resources"]
         if "local_disk" in resources:
             raise AssertionError(f"{filename}: GCP H200 tasks must not request unsupported local_disk")
@@ -258,14 +258,18 @@ def validate_local_syntax() -> None:
     if not (REPO_ROOT / "uv.lock").is_file():
         raise AssertionError("uv.lock is required for frozen reproducible worker installs")
     launch_text = (INFRA_DIR / "launch.sh").read_text(encoding="utf-8")
-    if 'jobs launch "$task_spec" --priority p1' not in launch_text:
-        raise AssertionError("P1 must remain the explicit, case-correct launch CLI priority")
+    if 'priority_class="p1"' not in launch_text:
+        raise AssertionError("P1 must remain the default launch priority")
+    if '--priority "$priority_class"' not in launch_text:
+        raise AssertionError("Launch priority must remain an explicit, validated CLI setting")
     for required_flag in ('--git-url "$git_url"', '--git-ref "$git_ref"', '--workspace "$sky_workspace"'):
         if required_flag not in launch_text:
             raise AssertionError(f"Actual launches must provide {required_flag}")
     k8s_launch_text = (INFRA_DIR / "launch_k8s.sh").read_text(encoding="utf-8")
-    if 'jobs launch "$rendered_task" --priority p1' not in k8s_launch_text:
-        raise AssertionError("Kubernetes launches must use the explicit p1 priority class")
+    if 'priority_class="p1"' not in k8s_launch_text:
+        raise AssertionError("Kubernetes launches must default to p1")
+    if '--priority "$priority_class"' not in k8s_launch_text:
+        raise AssertionError("Kubernetes launch priority must be an explicit, validated CLI setting")
     if 'check -w "$sky_workspace" -o json' not in k8s_launch_text:
         raise AssertionError("Kubernetes launches must verify workspace capability")
     scripts = sorted(INFRA_DIR.glob("*.sh"))
