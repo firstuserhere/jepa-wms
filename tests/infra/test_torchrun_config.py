@@ -234,3 +234,15 @@ def test_distributed_smoke_installs_numpy_for_object_collectives():
 
     assert '"torch==2.7.0"' in setup
     assert '"numpy==2.2.6"' in setup
+
+
+def test_pvc_staging_creates_and_checks_local_rsync_targets():
+    import yaml
+
+    task = yaml.safe_load((REPO_ROOT / "infra/skypilot/droid_stage.yaml").read_text(encoding="utf-8"))
+    run = task["run"]
+
+    assert "test -w /mnt/jepawm-datasets" in run
+    assert 'franka_target=/mnt/jepawm-datasets/franka_custom' in run
+    assert 'mkdir -p "$droid_target" "$franka_target"' in run
+    assert 'gsutil -m rsync -d -r "$franka_cache/franka_custom" "$franka_target"' in run

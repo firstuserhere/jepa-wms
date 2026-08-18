@@ -45,10 +45,16 @@ run: |
   if [[ "$JEPAWM_STORAGE_BACKEND" == gcs ]]; then
     test -n "$DROID_STORE_URI"
     droid_target="$DROID_STORE_URI/droid_raw"
+    franka_target="$DROID_STORE_URI/franka_custom"
   elif [[ "$JEPAWM_STORAGE_BACKEND" == pvc ]]; then
     test -n "$DROID_VOLUME_NAME"
     test -d /mnt/jepawm-datasets
+    test -w /mnt/jepawm-datasets
     droid_target=/mnt/jepawm-datasets/droid_raw
+    franka_target=/mnt/jepawm-datasets/franka_custom
+    # gsutil accepts a missing bucket prefix but requires local rsync targets
+    # to exist.  Create both durable destinations before transferring bytes.
+    mkdir -p "$droid_target" "$franka_target"
   else
     echo "JEPAWM_STORAGE_BACKEND must be gcs or pvc" >&2
     exit 2
@@ -65,11 +71,7 @@ run: |
     --revision 6116f042ae7ae4c8e3f1fd2f194f432615664182 \
     --include 'franka_custom/*' \
     --local-dir "$franka_cache"
-  if [[ "$JEPAWM_STORAGE_BACKEND" == gcs ]]; then
-    gsutil -m rsync -d -r "$franka_cache/franka_custom" "$DROID_STORE_URI/franka_custom"
-  else
-    gsutil -m rsync -d -r "$franka_cache/franka_custom" /mnt/jepawm-datasets/franka_custom
-  fi
+  gsutil -m rsync -d -r "$franka_cache/franka_custom" "$franka_target"
 
   verification_dir="$(mktemp -d)"
   trap 'rm -rf "$franka_cache" "$verification_dir"' EXIT
