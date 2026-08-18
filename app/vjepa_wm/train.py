@@ -5,7 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 #
 
+import hashlib
+import json
 import os
+import random
+import tempfile
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
 try:
@@ -43,6 +47,7 @@ from app.vjepa_wm.utils import (
     build_plan_eval_args,
     build_unroll_decode_eval_args,
     clean_state_dict,
+    fetch_checkpoint,
     init_opt,
     init_video_model,
     load_checkpoint,
@@ -51,8 +56,36 @@ from app.vjepa_wm.video_wm import VideoWM
 from evals.main_distributed import launch_evals_with_parsed_args as launch_evals
 from src.datasets.utils.utils import get_dataset_paths
 from src.utils.cluster import slurm_account_partition_and_qos
+from src.utils.checkpointing import (
+    CheckpointManager,
+    ResumeContractError,
+    atomic_json_dump,
+    atomic_torch_save,
+    build_checkpoint_v2,
+    capture_rng_state,
+    create_checkpoint_manifest,
+    gather_rng_states,
+    is_v2_checkpoint,
+    restore_rng_state,
+    restore_rank_rng_state,
+    sha256_file,
+    training_state_from_checkpoint,
+    validate_checkpoint_v2,
+    validate_resume_contract,
+)
 from src.utils.distributed import init_distributed
+from src.utils.dataset_manifest import (
+    verify_auxiliary_runtime_binding,
+    verify_droid_runtime_binding,
+)
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
+from src.utils.planning_promotion import (
+    drain_planning_evaluations,
+    load_planning_evaluation_registry,
+    mark_planning_evaluations_launched,
+    poll_planning_evaluations,
+    register_planning_evaluations,
+)
 from src.utils.yaml_utils import convert_to_dict_recursive, dump_yaml, expand_env_vars
 
 # --
@@ -71,6 +104,23 @@ torch.backends.cudnn.benchmark = True
 logger = get_logger(__name__)
 
 
+def _run_rank0_planning_controller(rank, operation, description):
+    """Run one checkpoint-controller mutation on rank zero and fan out errors."""
+
+    report = None
+    error = [None]
+    if rank == 0:
+        try:
+            report = operation()
+        except Exception as controller_error:
+            error[0] = f"{type(controller_error).__name__}: {controller_error}"
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.broadcast_object_list(error, src=0)
+    if error[0] is not None:
+        raise RuntimeError(f"{description} failed: {error[0]}")
+    return report
+
+
 def main(args, resume_preempt=False):
     # ----------------------------------------------------------------------- #
     #  PASSED IN PARAMS FROM CONFIG FILE
@@ -79,6 +129,18 @@ def main(args, resume_preempt=False):
     folder = args.get("folder")
     checkpoint_folder = args.get("checkpoint_folder", folder)
     os.makedirs(checkpoint_folder, exist_ok=True)
+    cfgs_checkpointing = args.get("checkpointing", {})
+    checkpointing_enabled = cfgs_checkpointing.get("enabled", False)
+    strict_continuation = cfgs_checkpointing.get("strict_continuation", False)
+    checkpoint_load_mode = cfgs_checkpointing.get("load_mode", "resume")
+    if checkpoint_load_mode not in ("resume", "fork"):
+        raise ValueError("checkpointing.load_mode must be 'resume' or 'fork'")
+    checkpoint_save_every = int(cfgs_checkpointing.get("save_every_epochs", checkpoint_freq))
+    if checkpoint_save_every <= 0:
+        raise ValueError("checkpointing.save_every_epochs must be positive")
+    checkpoint_keep_recent = int(cfgs_checkpointing.get("keep_recent", 0))
+    if checkpoint_keep_recent < 0:
+        raise ValueError("checkpointing.keep_recent must be non-negative")
     # -- META
     cfgs_meta = args.get("meta")
     load_model = cfgs_meta.get("load_checkpoint") or resume_preempt
@@ -86,12 +148,14 @@ def main(args, resume_preempt=False):
     freeze_encoder = cfgs_meta.get("freeze_encoder", True)
     r_file = cfgs_meta.get("read_checkpoint", None)
     pretrained_path = cfgs_meta.get("pretrained_path", None)
+    strict_checkpoint_weights = cfgs_meta.get("strict_checkpoint_weights", False)
     seed = cfgs_meta.get("seed", _GLOBAL_SEED)
 
     eval_freq = cfgs_meta.get("eval_freq", DEFAULT_EVAL_FREQ)
     plan_only_eval_mode = cfgs_meta.get("plan_only_eval_mode", False)
     unroll_decode_eval_only_mode = cfgs_meta.get("unroll_decode_eval_only_mode", False)
     light_eval_only_mode = cfgs_meta.get("light_eval_only_mode", False)
+    rollout_only_eval_mode = cfgs_meta.get("rollout_only_eval_mode", False)
 
     # -- LIGHT EVALS (keep as subconfigs, extract only frequently-checked flags)
     cfgs_data_traj_rollout_eval = cfgs_meta.get("data_traj_rollout_eval", {})
@@ -136,7 +200,6 @@ def main(args, resume_preempt=False):
     ctxt_window_train_rollout = rollout_cfg.get("ctxt_window_train_rollout", 8)
     do_parallel_rollout = rollout_cfg.get("do_parallel_rollout", False)
     do_sequential_rollout = rollout_cfg.get("do_sequential_rollout", True)
-    sampling_rollout = rollout_cfg.get("sampling_rollout", False)
     prepend_gt_rollout_parallel = rollout_cfg.get("prepend_gt", False)
 
     sampling_scheduler_cfg = rollout_cfg.get("sampling_scheduler", {})
@@ -162,6 +225,12 @@ def main(args, resume_preempt=False):
     cfgs_data = args.get("data")
     cfgs_validation = cfgs_data.get("validation", {})
     cfgs_loader = cfgs_data.get("loader", {})
+    if strict_continuation and cfgs_loader.get("persistent_workers", False):
+        logger.warning(
+            "Strict continuation recreates DataLoader workers at every epoch boundary; "
+            "forcing data.loader.persistent_workers=false."
+        )
+        cfgs_loader["persistent_workers"] = False
     cfgs_custom = cfgs_data.get("custom", {})
     cfgs_droid = cfgs_data.get("droid", {})
 
@@ -177,6 +246,38 @@ def main(args, resume_preempt=False):
     else:
         dataset_paths = get_dataset_paths(datasets)
 
+    dataset_manifest = None
+    dataset_manifest_path = cfgs_checkpointing.get("dataset_manifest_path")
+    if dataset_manifest_path:
+        if not os.path.isfile(dataset_manifest_path):
+            raise FileNotFoundError(f"Dataset manifest not found: {dataset_manifest_path}")
+        with open(dataset_manifest_path, "r", encoding="utf-8") as stream:
+            dataset_manifest = json.load(stream)
+        verification = dataset_manifest.get("verification", {})
+        if verification and not verification.get("complete", False):
+            raise RuntimeError(f"Dataset manifest is incomplete: {dataset_manifest_path}")
+        if cfgs_checkpointing.get("require_dataset_manifest", False) and not verification.get(
+            "files_checked", False
+        ):
+            raise RuntimeError(f"Dataset manifest was not file-verified: {dataset_manifest_path}")
+        if cfgs_checkpointing.get("require_source_inventory", False) and not verification.get(
+            "source_listing_matches_staged", False
+        ):
+            raise RuntimeError(
+                f"Dataset manifest does not match a verified official source inventory: {dataset_manifest_path}"
+            )
+        if not dataset_manifest.get("dataset_fingerprint"):
+            raise RuntimeError(f"Dataset manifest has no dataset_fingerprint: {dataset_manifest_path}")
+    elif cfgs_checkpointing.get("require_dataset_manifest", False):
+        raise RuntimeError("checkpointing.require_dataset_manifest=true requires dataset_manifest_path")
+    elif checkpointing_enabled:
+        dataset_manifest = {
+            "dataset": datasets,
+            "paths": dataset_paths,
+            "verified": False,
+            "warning": "No external dataset manifest was supplied",
+        }
+
     val_datasets = cfgs_validation.get("val_datasets", [])
     val_dataset_paths = get_dataset_paths(val_datasets) if val_datasets else None
 
@@ -185,6 +286,23 @@ def main(args, resume_preempt=False):
     val_datasets_1_paths = None
     if val_datasets_1 is not None:
         val_datasets_1_paths = get_dataset_paths(val_datasets_1.get("names"))
+
+    if dataset_manifest is not None and cfgs_checkpointing.get(
+        "require_runtime_dataset_binding", cfgs_checkpointing.get("require_dataset_manifest", False)
+    ):
+        if datasets == ["DROID"]:
+            dataset_manifest["runtime_binding"] = verify_droid_runtime_binding(
+                dataset_manifest, dataset_paths
+            )
+        if "Franka_hf" in val_datasets:
+            franka_index = val_datasets.index("Franka_hf")
+            dataset_manifest.setdefault("runtime_auxiliary_bindings", {})["Franka_hf"] = (
+                verify_auxiliary_runtime_binding(
+                    dataset_manifest,
+                    "Franka_hf",
+                    val_dataset_paths[franka_index],
+                )
+            )
 
     # Fields used outside init_data
     frameskip = cfgs_custom.get("frameskip", True)
@@ -217,6 +335,21 @@ def main(args, resume_preempt=False):
         train_predictor = cfgs_opt["heads"]["train_predictor"]
         train_heads_on_predictor = cfgs_opt["heads"]["train_heads_on_predictor"]
 
+    if rollout_only_eval_mode:
+        if not light_eval_only_mode:
+            raise ValueError("meta.rollout_only_eval_mode requires meta.light_eval_only_mode=true")
+        if plan_only_eval_mode or unroll_decode_eval_only_mode:
+            raise ValueError("rollout-only qualification cannot be combined with another eval-only mode")
+        if not checkpointing_enabled:
+            raise ValueError("rollout-only qualification requires checkpointing.enabled=true")
+        if not cfgs_checkpointing.get("rollout_promotion", {}).get("enabled", False):
+            raise ValueError("rollout-only qualification requires checkpointing.rollout_promotion.enabled=true")
+        if num_epochs != 1 or ipe != 1:
+            raise ValueError(
+                "rollout-only qualification must set transition_model num_epochs=1 and "
+                "iterations_per_epoch=1"
+            )
+
     # -- LOGGING
     cfgs_logging = args.get("logging")
     tag = cfgs_logging.get("write_tag", "jepa")
@@ -226,13 +359,20 @@ def main(args, resume_preempt=False):
     if light_eval_only_mode:
         light_eval_freq = 1
     if plan_only_eval_mode or light_eval_only_mode or quick_debug or unroll_decode_eval_only_mode:
-        filter_first_episodes, num_workers = 10, 0
+        # Qualification must retain the configured dataset rather than silently
+        # reducing it to the ten-episode interactive/debug subset.
+        if not rollout_only_eval_mode:
+            filter_first_episodes = 10
+        num_workers = 0
 
     # ----------------------------------------------------------------------- #
     # ----------------------------------------------------------------------- #
 
+    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = True
     try:
         mp.set_start_method("spawn")
@@ -246,7 +386,10 @@ def main(args, resume_preempt=False):
     if not torch.cuda.is_available():
         device = torch.device("cpu")
     else:
-        device = torch.device("cuda:0")
+        # Submitit pins each process to one visible device.  torchrun exposes
+        # all local devices and communicates the process binding via LOCAL_RANK.
+        local_rank = 0 if "SLURM_LOCALID" in os.environ else int(os.environ.get("LOCAL_RANK", "0"))
+        device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(device)
 
     # -- log/checkpointing paths
@@ -254,23 +397,39 @@ def main(args, resume_preempt=False):
     pref_tag = f"{tag}-" if tag else ""
     latest_file = pref_tag + f"latest.{latest_format}"
     latest_path = os.path.join(checkpoint_folder, latest_file)
+    checkpoint_manager = (
+        CheckpointManager(
+            checkpoint_folder,
+            prefix=tag or "jepa",
+            keep_recent=checkpoint_keep_recent,
+        )
+        if checkpointing_enabled
+        else None
+    )
+    managed_latest_path = None
+    if checkpoint_manager is not None:
+        try:
+            managed_latest_path = os.fspath(checkpoint_manager.resolve("latest", verify=True))
+        except FileNotFoundError:
+            pass
     finetune = pretrained_path is not None
     logger.info(f"{'🔧 Finetuning mode' if finetune else '🆕 Training from scratch'}")
     # finetune covers the case of training heads on top of frozen transition_model
     # if cfgs_model["pretrained_path"] is None, i.e. training head just on encoder
     head_training_mode = main_optimizer in ["image_head", "state_head"]
-    resume = os.path.exists(latest_path)
-    resume_finetune = os.path.exists(latest_path) and finetune
-    resume_latest = os.path.exists(latest_path) and not finetune
+    resume_path = managed_latest_path or (latest_path if os.path.exists(latest_path) else None)
+    resume = resume_path is not None
+    resume_finetune = resume and finetune
+    resume_latest = resume and not finetune
     if resume_finetune:
         logger.info("♻️  Resuming from checkpoint")
     load_path = None
     if load_model:
         if resume_finetune:
-            load_path = os.path.join(folder, r_file) if r_file is not None else latest_path
+            load_path = os.path.join(folder, r_file) if r_file is not None else resume_path
             load_opt_scale_epoch = not head_training_mode
         elif resume_latest:
-            load_path = latest_path
+            load_path = resume_path
             load_opt_scale_epoch = not head_training_mode
         else:  # not resuming, i.e. not os.path.exists(latest_path)
             load_path = pretrained_path
@@ -409,36 +568,109 @@ def main(args, resume_preempt=False):
     # Logger
     class Trainer:
         def __init__(self, config):
+            config = config or {}
             if quick_debug:
                 config["debug"] = quick_debug
             self.config = config
             self.ipe = ipe
-            self.use_wandb = config.get("use_wandb", False)
+            self.wandb_required = config.get("required", False)
+            self.wandb_required_online = config.get("required_online", False)
+            self.use_wandb = config.get("use_wandb", False) or self.wandb_required
             self.disable_wandb_media = config.get("disable_wandb_media", False)
             self.log_media_locally = config.get("log_media_locally", False)
+            self.wandb_run_id = None
             self.local_log_dir = None
             if self.log_media_locally and rank == 0:
                 self.local_log_dir = os.path.join(folder, "local_logs")
                 os.makedirs(self.local_log_dir, exist_ok=True)
             if self.use_wandb and rank == 0:
-                project_name = config.get("project", "vjepa_wm") if not config["debug"] else "vjepa_wm_debug"
-                wandb_run_id_file = os.path.join(folder, "wandb_run_id.txt")
+                wandb_mode = os.environ.get("WANDB_MODE", "online").lower()
+                if self.wandb_required_online and wandb_mode != "online":
+                    raise RuntimeError(
+                        f"Online W&B is required for this run, but WANDB_MODE={wandb_mode!r}"
+                    )
+                if self.wandb_required and not os.environ.get("WANDB_API_KEY") and os.environ.get(
+                    "WANDB_MODE", ""
+                ).lower() != "offline":
+                    raise RuntimeError("W&B is required, but WANDB_API_KEY is not present in the environment")
+                project_name = (
+                    config.get("project", "vjepa_wm")
+                    if not config.get("debug", False)
+                    else config.get("debug_project", "vjepa_wm_debug")
+                )
+                run_metadata_dir = os.path.join(checkpoint_folder, "run_metadata")
+                os.makedirs(run_metadata_dir, exist_ok=True)
+                wandb_run_id_file = os.path.join(run_metadata_dir, "wandb_run_id.txt")
                 if os.path.exists(wandb_run_id_file):
                     with open(wandb_run_id_file, "r") as f:
                         wandb_run_id = f.read().strip()
-                    wandb.init(project=project_name, id=wandb_run_id, resume="allow", dir=folder)
+                    if not wandb_run_id:
+                        raise RuntimeError(f"Empty W&B run ID file: {wandb_run_id_file}")
+                    resume_mode = "must"
+                else:
+                    latest_alias = (
+                        checkpoint_manager.read_alias("latest", verify=False)
+                        if checkpoint_manager is not None
+                        else None
+                    )
+                    alias_wandb_id = (
+                        latest_alias.get("checkpoint", {}).get("metadata", {}).get("wandb_run_id")
+                        if latest_alias is not None
+                        else None
+                    )
+                    if alias_wandb_id:
+                        wandb_run_id = str(alias_wandb_id)
+                        resume_mode = "must"
+                    elif latest_alias is not None:
+                        raise RuntimeError(
+                            "A latest checkpoint exists but its W&B identity sidecar is missing; "
+                            "refusing to split an exact continuation across runs"
+                        )
+                    else:
+                        wandb_run_id = wandb.util.generate_id()
+                        resume_mode = "never"
+                wandb.init(
+                    project=project_name,
+                    entity=config.get("entity"),
+                    group=config.get("group"),
+                    tags=config.get("tags"),
+                    id=wandb_run_id,
+                    resume=resume_mode,
+                    dir=folder,
+                    config=convert_to_dict_recursive(args),
+                )
+                self.wandb_run_id = wandb_run_id
+                if resume_mode == "must":
                     logger.info(f"Resuming Wandb run {wandb_run_id}")
                 else:
-                    wandb.init(project=project_name, dir=folder)
-                    with open(wandb_run_id_file, "w") as f:
-                        f.write(wandb.run.id)
+                    descriptor, temporary_path = tempfile.mkstemp(
+                        prefix=".wandb_run_id.", suffix=".tmp", dir=run_metadata_dir
+                    )
+                    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                        stream.write(wandb_run_id)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary_path, wandb_run_id_file)
                 wandb.run.name = os.path.basename(folder)
+                wandb.define_metric("global_step")
+                wandb.define_metric("*", step_metric="global_step")
                 self.job_set = set()
 
-        def log(self, epoch, itr, losses, total_stats, eval_losses=None, eval_total_stats=None, image_stats=None):
+        def log(
+            self,
+            epoch,
+            itr,
+            losses,
+            total_stats,
+            eval_losses=None,
+            eval_total_stats=None,
+            image_stats=None,
+            global_step=None,
+        ):
             log_dict = {
                 "epoch": epoch + 1,
                 "itr": itr,
+                "global_step": epoch * self.ipe + itr + 1 if global_step is None else global_step,
             }
             for key, value in losses.items():
                 if isinstance(value, torch.Tensor):
@@ -462,7 +694,7 @@ def main(args, resume_preempt=False):
             if "loss" in log_dict.keys() and itr % log_freq == 0:
                 logger.info("[%d, %5d] " "loss: %.3f | " % (epoch + 1, itr, log_dict["loss"]))
             if self.use_wandb and rank == 0:
-                wandb.log(log_dict)
+                wandb.log(log_dict, step=log_dict["global_step"])
 
         def log_media_local(self, image_stats, epoch=None, itr=None):
             step = epoch * ipe + itr
@@ -480,6 +712,24 @@ def main(args, resume_preempt=False):
                     value.savefig(os.path.join(subfolder, filename), bbox_inches=None)
 
     trainer = Trainer(cfgs_wandb)
+    if checkpointing_enabled and not trainer.use_wandb:
+        raise RuntimeError("Schema-v2 research checkpoints require logging.wandb.required=true")
+    if checkpoint_manager is not None:
+        repair_report = _run_rank0_planning_controller(
+            rank,
+            checkpoint_manager.repair_embedded_promotions,
+            "checkpoint role repair",
+        )
+        if rank == 0 and trainer.use_wandb:
+            repaired_rollout = repair_report.get("repaired", {}).get("best_rollout")
+            if repaired_rollout is not None:
+                best_rollout_alias = checkpoint_manager.read_alias("best_rollout", verify=True)
+                wandb.run.summary["best_rollout/checkpoint_id"] = best_rollout_alias["checkpoint"][
+                    "object_id"
+                ]
+                wandb.run.summary["best_rollout/value"] = best_rollout_alias["promotion"][
+                    "metric_value"
+                ]
 
     # -- init model
     if use_action:
@@ -488,10 +738,9 @@ def main(args, resume_preempt=False):
     else:
         actions_per_vid_feat, model_action_dim = None, None
     if use_proprio:
-        proprio_multiplier = tubelet_size_enc * frameskip // state_skip
         model_proprio_dim = traj_dataset.proprio_dim * tubelet_size_enc // state_skip
     else:
-        proprio_multiplier, model_proprio_dim = None, None
+        model_proprio_dim = None
 
     # Prepare model kwargs by flattening nested configs and filtering out non-init_video_model fields
     excluded_keys = [
@@ -526,6 +775,22 @@ def main(args, resume_preempt=False):
         }
     )
     predictor, encoder, action_encoder, proprio_encoder = init_video_model(**model_kwargs)
+    encoder_manifest = {
+        "encoder_type": cfgs_model["visual_encoder"].get("enc_type"),
+        "encoder_version": cfgs_model["visual_encoder"].get("enc_version"),
+        "feature_key": getattr(encoder, "feature_key", None),
+        "patch_size": int(encoder.patch_size),
+        "frozen": bool(freeze_encoder),
+        "repo_revision": getattr(encoder, "repo_revision", None),
+        "weights_sha256": getattr(encoder, "weights_sha256", None),
+        "weights_filename": (
+            os.path.basename(encoder.weights_path) if getattr(encoder, "weights_path", None) else None
+        ),
+    }
+    if checkpointing_enabled and cfgs_model["visual_encoder"].get("enc_version", "").startswith("dinov3"):
+        for required_provenance in ("repo_revision", "weights_sha256"):
+            if not encoder_manifest[required_provenance]:
+                raise RuntimeError(f"DINOv3 {required_provenance} is required for research checkpoints")
 
     heads = {}
     if train_heads or pretrain_dec_path is not None:
@@ -562,26 +827,25 @@ def main(args, resume_preempt=False):
         )
         clip_grad = cfgs_opt["transition_model"]["clip_grad"]
         use_radamw = cfgs_opt["transition_model"]["use_radamw"]
-        if sampling_scheduler_type == "linear":
-            # linear decay from sampling_scheduler_start to sampling_scheduler_end
-            rollout_sampling_scheduler = (
-                sampling_scheduler_start - i * (sampling_scheduler_start - sampling_scheduler_end) / (ipe * num_epochs)
-                for i in range(int(ipe * num_epochs) + 1)
-            )
-        elif sampling_scheduler_type == "exponential":
-            # exponential decay from sampling_scheduler_start to sampling_scheduler_end
-            rollout_sampling_scheduler = (
-                sampling_scheduler_start
-                * (sampling_scheduler_end / sampling_scheduler_start) ** (i / (ipe * num_epochs))
-                for i in range(int(ipe * num_epochs) + 1)
-            )
-        elif sampling_scheduler_type == "sigmoid":
-            rollout_sampling_scheduler = (
-                sampling_scheduler_start
-                + (sampling_scheduler_end - sampling_scheduler_start)
-                * (1 / (1 + np.exp(-10 * (i / (ipe * num_epochs) - 0.5))))
-                for i in range(int(ipe * num_epochs) + 1)
-            )
+        def rollout_sampling_probability(global_update):
+            """Serializable rollout-sampling schedule derived only from update."""
+
+            progress = min(1.0, max(0.0, global_update / float(max(1, ipe * num_epochs))))
+            if sampling_scheduler_type == "linear":
+                return sampling_scheduler_start + progress * (
+                    sampling_scheduler_end - sampling_scheduler_start
+                )
+            if sampling_scheduler_type == "exponential":
+                if sampling_scheduler_start == 0.0:
+                    return 0.0
+                return sampling_scheduler_start * (
+                    sampling_scheduler_end / sampling_scheduler_start
+                ) ** progress
+            if sampling_scheduler_type == "sigmoid":
+                return sampling_scheduler_start + (sampling_scheduler_end - sampling_scheduler_start) * (
+                    1 / (1 + np.exp(-10 * (progress - 0.5)))
+                )
+            raise ValueError(f"Unknown rollout sampling scheduler: {sampling_scheduler_type}")
     else:
         optimizer, scaler, scheduler, wd_scheduler, clip_grad, use_radamw = None, None, None, None, None, None
     if train_heads:
@@ -589,39 +853,177 @@ def main(args, resume_preempt=False):
             head.init_opt(**dict(cfgs_opt["heads"][name]))
 
     start_epoch = 0
+    pending_resume_rng_bundle = None
+    run_lineage = []
     # -- load training checkpoint
     if load_model:
-        # to resume predictor or head training
-        load_heads = heads and not pretrain_dec_path and resume
-        logger.info(f"Load heads: {load_heads}")
-        (
-            predictor,
-            action_encoder,
-            proprio_encoder,
-            heads,
-            optimizer,
-            scaler,
-            start_epoch,
-        ) = load_checkpoint(
-            r_path=load_path,
-            predictor=predictor,
-            action_encoder=action_encoder,
-            proprio_encoder=proprio_encoder,
-            heads=heads,
-            opt=optimizer,
-            scaler=scaler,
-            load_opt_scale_epoch=load_opt_scale_epoch,
-            load_heads=load_heads,
-            train_heads=train_heads,
-            train_predictor=train_predictor,
-        )
-        # Only resume the schedulers if we resume a pretraining or a finetuning
-        # Not if we start a finetuning: we reset them
-        if load_opt_scale_epoch and scheduler is not None and wd_scheduler is not None:
-            for _ in range(start_epoch * ipe):
-                scheduler.step()
-                wd_scheduler.step()
-        if light_eval_only_mode:
+        continuation_resume = resume_path is not None and os.path.realpath(load_path) == os.path.realpath(resume_path)
+        raw_checkpoint = fetch_checkpoint(load_path, device="cpu")
+        if is_v2_checkpoint(raw_checkpoint):
+            validate_checkpoint_v2(raw_checkpoint)
+            saved_encoder = raw_checkpoint["manifest"]["encoder"]
+            for provenance_key in ("encoder_version", "repo_revision", "weights_sha256", "patch_size"):
+                if saved_encoder.get(provenance_key) != encoder_manifest.get(provenance_key):
+                    raise ResumeContractError(
+                        f"Encoder provenance mismatch for {provenance_key}: "
+                        f"{saved_encoder.get(provenance_key)!r} != {encoder_manifest.get(provenance_key)!r}"
+                    )
+
+            # A fork applies only to the external parent.  Once this new stage
+            # has published its own ``latest`` role, managed recovery is an
+            # exact continuation even though the resolved config retains its
+            # lineage declaration.
+            fork_from_checkpoint = checkpoint_load_mode == "fork" and not continuation_resume
+            if fork_from_checkpoint:
+                if cfgs_checkpointing.get("fork_optimizer", "reset") != "reset":
+                    raise ValueError(
+                        "Only checkpointing.fork_optimizer=reset is supported: a changed dataset or schedule "
+                        "must start a new optimizer/scheduler trajectory"
+                    )
+                parent_manifest = raw_checkpoint["manifest"]
+                run_lineage = list(parent_manifest.get("lineage", []))
+                run_lineage.append(
+                    {
+                        "relation": "continued_pretraining_fork",
+                        "checkpoint_sha256": sha256_file(load_path),
+                        "checkpoint_path": os.path.realpath(load_path),
+                        "epoch": int(raw_checkpoint["progress"]["epoch"]),
+                        "global_update": int(raw_checkpoint["progress"]["global_update"]),
+                        "wandb_run_id": parent_manifest["wandb"]["run_id"],
+                        "dataset_fingerprint": parent_manifest["dataset"].get("dataset_fingerprint"),
+                        "encoder": parent_manifest["encoder"],
+                        "source_git": parent_manifest["git"],
+                        "optimizer_policy": "reset",
+                    }
+                )
+            else:
+                if not continuation_resume:
+                    raise RuntimeError(
+                        "Schema-v2 exact continuation checkpoints must be loaded through a managed resume role; "
+                        "set checkpointing.load_mode=fork only for an explicitly new pretraining stage"
+                    )
+                if strict_continuation:
+                    validate_resume_contract(raw_checkpoint["manifest"]["resume_contract"], args)
+                saved_dataset = raw_checkpoint["manifest"]["dataset"]
+                if dataset_manifest is not None and saved_dataset.get(
+                    "dataset_fingerprint"
+                ) != dataset_manifest.get("dataset_fingerprint"):
+                    raise ResumeContractError("Dataset fingerprint changed since the checkpoint was written")
+                saved_wandb_id = raw_checkpoint["manifest"]["wandb"]["run_id"]
+                if rank == 0 and trainer.use_wandb and trainer.wandb_run_id != saved_wandb_id:
+                    raise ResumeContractError(
+                        f"W&B run mismatch: checkpoint={saved_wandb_id}, active={trainer.wandb_run_id}"
+                    )
+                run_lineage = list(raw_checkpoint["manifest"].get("lineage", []))
+
+            state = training_state_from_checkpoint(raw_checkpoint)
+            predictor.load_state_dict(clean_state_dict(state["predictor"]), strict=True)
+            if action_encoder is not None:
+                action_encoder.load_state_dict(clean_state_dict(state["action_encoder"]), strict=True)
+            if proprio_encoder is not None:
+                proprio_encoder.load_state_dict(clean_state_dict(state["proprio_encoder"]), strict=True)
+            if not freeze_encoder:
+                encoder.load_state_dict(clean_state_dict(state["encoder"]), strict=True)
+            for name, head in heads.items():
+                head.model.load_state_dict(clean_state_dict(state["heads"][name]["model"]), strict=True)
+
+            if load_opt_scale_epoch and not fork_from_checkpoint:
+                if optimizer is None or state.get("optimizer") is None:
+                    raise ResumeContractError("Continuation checkpoint has no transition optimizer state")
+                optimizer.load_state_dict(state["optimizer"])
+                if scaler is not None:
+                    scaler.load_state_dict(state["scaler"])
+                scheduler.load_state_dict(state["schedulers"]["lr"])
+                wd_scheduler.load_state_dict(state["schedulers"]["weight_decay"])
+                for name, head in heads.items():
+                    head_state = state["heads"][name]
+                    if head.optimizer is not None:
+                        head.optimizer.load_state_dict(head_state["optimizer"])
+                    if head.scaler is not None:
+                        head.scaler.load_state_dict(head_state["scaler"])
+                    if head.scheduler is not None:
+                        head.scheduler.load_state_dict(head_state["scheduler"])
+                    if head.wd_scheduler is not None:
+                        head.wd_scheduler.load_state_dict(head_state["weight_decay_scheduler"])
+
+            saved_sampler = raw_checkpoint["sampler"]
+            if strict_continuation and not fork_from_checkpoint:
+                sampler_contract = saved_sampler["contract"]
+                current_sampler_contract = {
+                    "world_size": world_size,
+                    "sampler_class": type(unsupervised_sampler).__name__,
+                    "dataset_length": len(dataset),
+                    "batches_per_epoch": len(unsupervised_loader),
+                    "iterations_per_epoch": ipe,
+                    "batch_size_per_rank": cfgs_loader.get("batch_size"),
+                }
+                if sampler_contract != current_sampler_contract:
+                    raise ResumeContractError(
+                        f"Distributed sampler contract changed: {sampler_contract} != {current_sampler_contract}"
+                    )
+            if fork_from_checkpoint:
+                start_epoch = 0
+                logger.info(
+                    "Forked a schema-v2 checkpoint into a new continued-pretraining stage; "
+                    "optimizer, schedulers, progress, sampler, RNG and W&B identity were reset"
+                )
+            else:
+                start_epoch = int(raw_checkpoint["progress"]["epoch"])
+                saved_global_update = int(raw_checkpoint["progress"]["global_update"])
+                if saved_global_update != start_epoch * ipe:
+                    raise ResumeContractError(
+                        f"Checkpoint is not an epoch-boundary recovery point: "
+                        f"global_update={saved_global_update}, expected={start_epoch * ipe}"
+                    )
+                # Restore only after DDP, VideoWM, LPIPS and loader iterator
+                # construction.  Those constructors may consume CPU/CUDA RNG.
+                pending_resume_rng_bundle = raw_checkpoint["rng"]
+            del raw_checkpoint
+            if not fork_from_checkpoint:
+                logger.info(f"Strictly resumed schema-v2 checkpoint at epoch {start_epoch}")
+        else:
+            del raw_checkpoint
+            if continuation_resume and strict_continuation and not cfgs_checkpointing.get(
+                "allow_legacy_continuation", False
+            ):
+                raise ResumeContractError(
+                    "Refusing a permissive legacy checkpoint as an exact continuation; "
+                    "use it as pretrained weights or explicitly allow_legacy_continuation"
+                )
+            # Legacy/released checkpoints are intentionally a weights-transfer path.
+            load_heads = heads and not pretrain_dec_path and resume
+            logger.info(f"Load legacy heads: {load_heads}")
+            (
+                predictor,
+                action_encoder,
+                proprio_encoder,
+                heads,
+                optimizer,
+                scaler,
+                start_epoch,
+            ) = load_checkpoint(
+                r_path=load_path,
+                predictor=predictor,
+                action_encoder=action_encoder,
+                proprio_encoder=proprio_encoder,
+                heads=heads,
+                opt=optimizer,
+                scaler=scaler,
+                load_opt_scale_epoch=load_opt_scale_epoch,
+                load_heads=load_heads,
+                train_heads=train_heads,
+                train_predictor=train_predictor,
+                strict_weights=strict_checkpoint_weights,
+            )
+            if load_opt_scale_epoch and scheduler is not None and wd_scheduler is not None:
+                for _ in range(start_epoch * ipe):
+                    scheduler.step()
+                    wd_scheduler.step()
+        if rollout_only_eval_mode:
+            # A released legacy checkpoint may carry an arbitrary training
+            # epoch.  Qualification is a single independent evaluation pass.
+            start_epoch = 0
+        elif light_eval_only_mode:
             start_epoch -= 1
 
     # Load pretrained heads from pretrain_dec_path
@@ -696,33 +1098,156 @@ def main(args, resume_preempt=False):
     # -- Initialize LPIPS once for evaluation
     lpips = lpips_lib.LPIPS(net="vgg").eval().to(device)
 
-    def save_checkpoint(epoch, path):
-        if rank != 0:
-            return
-        save_dict = {
-            "predictor": world_model.predictor.state_dict() if world_model.predictor is not None else None,
-            "opt": optimizer.state_dict() if optimizer is not None else None,
-            "scaler": None if scaler is None else scaler.state_dict(),
-            "epoch": epoch,
+    def _module_state_dict(module):
+        if module is None:
+            return None
+        return (module.module if isinstance(module, DDP) else module).state_dict()
+
+    def _gather_sampler_state(completed_epoch):
+        local_state = {
+            "rank": rank,
+            "sampler_epoch": completed_epoch,
+            "sampler_seed": getattr(unsupervised_sampler, "seed", seed),
+            "loader_generator": (
+                unsupervised_loader.generator.get_state()
+                if getattr(unsupervised_loader, "generator", None) is not None
+                else None
+            ),
+            "dataset_rng": dataset.rng.get_state() if hasattr(dataset, "rng") else None,
         }
-        if world_model.action_encoder is not None and not cfgs_model["action_encoder"].get(
-            "action_encoder_inpred", False
-        ):
-            save_dict.update({"action_encoder": world_model.action_encoder.state_dict()})
-        if (
-            world_model.proprio_encoder is not None
-            and use_proprio
-            and not cfgs_model["proprio_encoder"].get("proprio_encoder_inpred", False)
-        ):
-            save_dict.update({"proprio_encoder": world_model.proprio_encoder.state_dict()})
-        if train_heads:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            states = [None] * world_size
+            torch.distributed.all_gather_object(states, local_state)
+        else:
+            states = [local_state]
+        return {
+            "contract": {
+                "world_size": world_size,
+                "sampler_class": type(unsupervised_sampler).__name__,
+                "dataset_length": len(dataset),
+                "batches_per_epoch": len(unsupervised_loader),
+                "iterations_per_epoch": ipe,
+                "batch_size_per_rank": cfgs_loader.get("batch_size"),
+            },
+            "rank_states": {str(item["rank"]): item for item in states},
+            "iteration_in_epoch": 0,
+        }
+
+    def save_checkpoint(epoch, path=None, promotion_metrics=None, pending_planning=False):
+        """Save an epoch-boundary continuation state; all ranks must call."""
+
+        global_update = epoch * ipe
+        if checkpoint_manager is None:
+            if rank != 0:
+                return None
+            save_dict = {
+                "predictor": _module_state_dict(world_model.predictor),
+                "opt": optimizer.state_dict() if optimizer is not None else None,
+                "scaler": None if scaler is None else scaler.state_dict(),
+                "epoch": epoch,
+                "global_update": global_update,
+            }
+            if world_model.action_encoder is not None:
+                save_dict["action_encoder"] = _module_state_dict(world_model.action_encoder)
+            if world_model.proprio_encoder is not None:
+                save_dict["proprio_encoder"] = _module_state_dict(world_model.proprio_encoder)
+            atomic_torch_save(save_dict, path)
+            return None
+
+        rng_bundle = gather_rng_states()
+        sampler_bundle = _gather_sampler_state(epoch)
+        reference_dict = None
+        if rank == 0:
+            head_states = {}
             for name, head in world_model.heads.items():
-                head_path = path.removesuffix(".pth.tar") + "_" + name + ".pth.tar"
-                head.save_checkpoint(epoch, head_path)
-        try:
-            torch.save(save_dict, path)
-        except Exception as e:
-            logger.info(f"Encountered exception when saving checkpoint: {e}")
+                head_states[name] = {
+                    "model": _module_state_dict(head.model),
+                    "optimizer": head.optimizer.state_dict() if head.optimizer is not None else None,
+                    "scaler": head.scaler.state_dict() if head.scaler is not None else None,
+                    "scheduler": head.scheduler.state_dict() if head.scheduler is not None else None,
+                    "weight_decay_scheduler": (
+                        head.wd_scheduler.state_dict() if head.wd_scheduler is not None else None
+                    ),
+                }
+            training_state = {
+                "predictor": _module_state_dict(world_model.predictor),
+                "action_encoder": _module_state_dict(world_model.action_encoder),
+                "proprio_encoder": _module_state_dict(world_model.proprio_encoder),
+                "encoder": _module_state_dict(world_model.encoder) if not freeze_encoder else None,
+                "heads": head_states,
+                "optimizer": optimizer.state_dict() if optimizer is not None else None,
+                "scaler": scaler.state_dict() if scaler is not None else None,
+                "schedulers": {
+                    "lr": scheduler.state_dict() if scheduler is not None else None,
+                    "weight_decay": wd_scheduler.state_dict() if wd_scheduler is not None else None,
+                    "rollout_sampling": {
+                        "type": sampling_scheduler_type,
+                        "start": sampling_scheduler_start,
+                        "end": sampling_scheduler_end,
+                        "global_update": global_update,
+                    },
+                },
+            }
+            manifest = create_checkpoint_manifest(
+                resolved_config=args,
+                dataset_manifest=dataset_manifest,
+                encoder_manifest=encoder_manifest,
+                wandb_run_id=trainer.wandb_run_id,
+                promotion_metrics=promotion_metrics or {},
+                lineage=run_lineage,
+                require_git_manifest=cfgs_checkpointing.get("require_git_manifest", False),
+            )
+            checkpoint = build_checkpoint_v2(
+                training_state=training_state,
+                epoch=epoch,
+                global_update=global_update,
+                rng_state=rng_bundle,
+                sampler_state=sampler_bundle,
+                manifest=manifest,
+                legacy_fields={
+                    "predictor": training_state["predictor"],
+                    "action_encoder": training_state["action_encoder"],
+                    "proprio_encoder": training_state["proprio_encoder"],
+                    "opt": training_state["optimizer"],
+                    "scaler": training_state["scaler"],
+                    "epoch": epoch,
+                    "global_update": global_update,
+                },
+            )
+            reference = checkpoint_manager.save(
+                checkpoint,
+                global_update=global_update,
+                epoch=epoch,
+                metadata={
+                    "dataset_fingerprint": dataset_manifest.get("dataset_fingerprint"),
+                    "encoder_weights_sha256": encoder_manifest.get("weights_sha256"),
+                    "wandb_run_id": trainer.wandb_run_id,
+                    "promotion_metrics": promotion_metrics or {},
+                },
+                pending=pending_planning,
+            )
+            checkpoint_manager.promote("latest", reference)
+            reference_dict = reference.to_dict()
+            if promotion_metrics and "best_rollout" in promotion_metrics:
+                rollout_metric = promotion_metrics["best_rollout"]
+                promoted = checkpoint_manager.promote(
+                    "best_rollout",
+                    reference,
+                    metric_name=rollout_metric["metric_name"],
+                    metric_value=rollout_metric["metric_value"],
+                    mode=rollout_metric.get("mode", "min"),
+                    metrics=rollout_metric,
+                    tie_break="older",
+                )
+                if promoted and trainer.use_wandb:
+                    wandb.run.summary["best_rollout/checkpoint_id"] = reference.object_id
+                    wandb.run.summary["best_rollout/value"] = rollout_metric["metric_value"]
+            checkpoint_manager.garbage_collect()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            shared_reference = [reference_dict]
+            torch.distributed.broadcast_object_list(shared_reference, src=0)
+            reference_dict = shared_reference[0]
+        return reference_dict
 
     logger.info("Initializing loader...")
     train_loader = iter(unsupervised_loader)
@@ -734,8 +1259,15 @@ def main(args, resume_preempt=False):
     if viz_val_data_loader is not None:
         viz_val_loader_iter = iter(viz_val_data_loader)
 
+    if pending_resume_rng_bundle is not None:
+        restore_rank_rng_state(
+            pending_resume_rng_bundle,
+            rank=rank,
+            strict_world_size=strict_continuation,
+        )
+        pending_resume_rng_bundle = None
+
     def load_clips(sample):
-        all_clips = []
         return sample[0][0].to(device, non_blocking=True), None, None
 
     def get_batch(train=True, idx=0):
@@ -811,6 +1343,99 @@ def main(args, resume_preempt=False):
             all_clips = {"visual": all_clips}
             return all_clips, None, None, None, all_masks_enc, all_masks_pred
 
+    # Repair/promote results that may have arrived while a managed training job
+    # was preempted.  A recovered synchronous final evaluation must be rerun if
+    # it did not publish all results; asynchronous jobs can be drained in place.
+    if checkpoint_manager is not None and cfgs_plan_evals and cfgs_plan_evals.get("eval_cfg_paths"):
+        planning_registry_path = os.path.join(checkpoint_folder, "planning_results", "registry.json")
+        final_drain_timeout = float(cfgs_plan_evals.get("final_drain_timeout_seconds", 4 * 60 * 60))
+        final_drain_interval = float(cfgs_plan_evals.get("final_drain_poll_interval_seconds", 10.0))
+        final_drain_required = bool(cfgs_plan_evals.get("final_drain_required", True))
+        recovery_report = _run_rank0_planning_controller(
+            rank,
+            lambda: poll_planning_evaluations(planning_registry_path, manager=checkpoint_manager),
+            "planning-evaluation recovery poll",
+        )
+        recovery_plan = [None]
+
+        def build_recovery_plan():
+            registry = load_planning_evaluation_registry(planning_registry_path)
+            pending_candidates = checkpoint_manager._read_pending()["candidates"]
+            registered_pending = set(recovery_report["pending_checkpoint_ids"] if recovery_report else [])
+            orphaned = set(pending_candidates) - set(registry["checkpoints"])
+            if cfgs_plan_evals.get("separate", True):
+                never_launched = {
+                    checkpoint_id
+                    for checkpoint_id in registered_pending
+                    if registry["checkpoints"][checkpoint_id]["launch_state"] == "registered"
+                }
+                relaunch_ids = orphaned | never_launched
+            else:
+                # Synchronous workers die with the training job, so every
+                # incomplete registered checkpoint must be rerun after recovery.
+                relaunch_ids = orphaned | registered_pending
+            missing_references = sorted(relaunch_ids - set(pending_candidates))
+            if missing_references:
+                raise RuntimeError(
+                    f"planning registry references checkpoints that are not pinned: {missing_references}"
+                )
+            references = [pending_candidates[item]["checkpoint"] for item in relaunch_ids]
+            references.sort(key=lambda item: int(item["global_update"]))
+            recovery_plan[0] = {
+                "references": references,
+                "remaining_registered_pending": sorted(registered_pending - relaunch_ids),
+            }
+
+        _run_rank0_planning_controller(
+            rank,
+            build_recovery_plan,
+            "planning-evaluation recovery-plan construction",
+        )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast_object_list(recovery_plan, src=0)
+
+        for recovered_reference in recovery_plan[0]["references"]:
+            recovered_epoch = int(recovered_reference.get("epoch") or start_epoch)
+            logger.info("Relaunching incomplete planning evaluation: %s", recovered_reference["object_id"])
+            launch_planning_evals(
+                rank,
+                recovered_epoch,
+                folder,
+                recovered_reference["relative_path"],
+                cfgs_plan_evals,
+                cfgs_model,
+                cfgs_data,
+                cfgs_data_aug,
+                "",
+                world_model=world_model,
+                dset=val_traj_dataset,
+                preprocessor=preprocessor,
+                checkpoint_folder=checkpoint_folder,
+                checkpoint_reference=recovered_reference,
+                checkpoint_manager=checkpoint_manager,
+                wandb_trainer=trainer,
+                final_epoch=recovered_epoch >= num_epochs,
+            )
+            world_model.train()
+
+        if (
+            start_epoch >= num_epochs
+            and recovery_plan[0]["remaining_registered_pending"]
+            and cfgs_plan_evals.get("separate", True)
+            and (final_drain_timeout > 0 or final_drain_required)
+        ):
+            _run_rank0_planning_controller(
+                rank,
+                lambda: drain_planning_evaluations(
+                    planning_registry_path,
+                    manager=checkpoint_manager,
+                    timeout_seconds=final_drain_timeout,
+                    poll_interval_seconds=final_drain_interval,
+                    raise_on_timeout=final_drain_required,
+                ),
+                "final planning-evaluation recovery drain",
+            )
+
     # -- TRAINING LOOP
     if not (plan_only_eval_mode or unroll_decode_eval_only_mode):
         for epoch in range(start_epoch, num_epochs):
@@ -820,6 +1445,12 @@ def main(args, resume_preempt=False):
 
             # -- update distributed-data-loader epoch
             unsupervised_sampler.set_epoch(epoch)
+            if strict_continuation:
+                # Recreate workers/iterator from an epoch-derived seed.  This
+                # makes the next completed epoch reproducible after recovery.
+                if getattr(unsupervised_loader, "generator", None) is not None:
+                    unsupervised_loader.generator.manual_seed(seed + rank + epoch * world_size)
+                train_loader = iter(unsupervised_loader)
 
             loss_meter = AverageMeter()
             gpu_time_meter = AverageMeter()
@@ -1026,7 +1657,7 @@ def main(args, resume_preempt=False):
                                     for j in range(len(stats[k])):
                                         train_rollout_result[f"train_rollout/{k}/{j+2}"] = stats[k][j].item()
                         if do_parallel_rollout:
-                            gt_prob = next(rollout_sampling_scheduler)
+                            gt_prob = rollout_sampling_probability(epoch * ipe + itr)
                             rates["info/transition_model/sampling_gt_prob"] = gt_prob
                             with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
                                 stats = defaultdict(list)
@@ -1420,11 +2051,186 @@ def main(args, resume_preempt=False):
                     assert not np.isnan(loss), "loss is nan"
             logger.info("avg. loss %.3f" % loss_meter.avg)
 
-            # -- Save Last
+            # -- Deterministic held-out rollout promotion
+            promotion_metrics = {}
+            rollout_promotion_cfg = cfgs_checkpointing.get("rollout_promotion", {})
+            rollout_promotion_due = (
+                checkpointing_enabled
+                and rollout_promotion_cfg.get("enabled", False)
+                and (
+                    (epoch + 1) % int(rollout_promotion_cfg.get("every_epochs", 1)) == 0
+                    or epoch == (num_epochs - 1)
+                )
+            )
+            if rollout_promotion_due:
+                loader_index = int(rollout_promotion_cfg.get("loader_index", 0))
+                if not val_loader_iters or loader_index >= len(val_loader_iters):
+                    raise RuntimeError(f"No validation loader {loader_index} for best_rollout promotion")
+                promotion_loader = val_data_iters[loader_index][2]
+                if hasattr(promotion_loader.sampler, "set_epoch"):
+                    promotion_loader.sampler.set_epoch(int(rollout_promotion_cfg.get("sampler_epoch", 0)))
+                if getattr(promotion_loader, "generator", None) is not None:
+                    promotion_loader.generator.manual_seed(
+                        int(rollout_promotion_cfg.get("seed", seed + 50_000 + loader_index))
+                    )
+                val_loader_iters[loader_index] = iter(promotion_loader)
+                max_batches = rollout_promotion_cfg.get("max_batches")
+                num_batches = len(promotion_loader) if max_batches is None else min(int(max_batches), len(promotion_loader))
+                max_horizon = min(
+                    int(cfgs_data_traj_rollout_eval.get("data_traj_eval_rollout_steps", 1)),
+                    int(cfgs_validation.get("num_frames_val", 2)) - 1,
+                )
+                horizons = rollout_promotion_cfg.get("horizons", list(range(1, max_horizon + 1)))
+                metric_base = rollout_promotion_cfg.get(
+                    "metric_base", "data_traj/val_rollout/visual_l2_loss"
+                )
+                metric_keys = [f"{metric_base}/{int(horizon)}" for horizon in horizons]
+                metric_sums = {key: 0.0 for key in metric_keys}
+                metric_count = 0
+                for _ in range(num_batches):
+                    p_obs, p_action, p_state, p_reward, _, _ = get_batch(train=False, idx=loader_index)
+                    with torch.no_grad():
+                        _, _, _, p_stats, _ = step_model(p_obs, p_action, p_state, p_reward, train=False)
+                    missing_metrics = [key for key in metric_keys if key not in p_stats]
+                    if missing_metrics:
+                        raise RuntimeError(
+                            f"Rollout promotion metrics missing: {missing_metrics}; "
+                            f"available={sorted(p_stats)}"
+                        )
+                    batch_count = int(p_obs["visual"].shape[0])
+                    for key in metric_keys:
+                        metric_sums[key] += float(p_stats[key]) * batch_count
+                    metric_count += batch_count
+                reduced = torch.tensor(
+                    [metric_sums[key] for key in metric_keys] + [metric_count],
+                    dtype=torch.float64,
+                    device=device,
+                )
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(reduced, op=torch.distributed.ReduceOp.SUM)
+                total_count = int(reduced[-1].item())
+                if total_count <= 0:
+                    raise RuntimeError("Rollout promotion evaluated zero examples")
+                horizon_metrics = {
+                    key: reduced[index].item() / total_count for index, key in enumerate(metric_keys)
+                }
+                aggregation = rollout_promotion_cfg.get("aggregation", "mean")
+                if aggregation != "mean":
+                    raise ValueError("checkpointing.rollout_promotion.aggregation must be 'mean'")
+                primary_key = rollout_promotion_cfg.get(
+                    "metric_name",
+                    f"{metric_base}/mean_h" + "_h".join(str(int(horizon)) for horizon in horizons),
+                )
+                primary_value = float(np.mean([horizon_metrics[key] for key in metric_keys]))
+                if not np.isfinite(primary_value):
+                    raise RuntimeError(f"Non-finite rollout promotion metric: {primary_value}")
+                promotion_metrics["best_rollout"] = {
+                    "metric_name": primary_key,
+                    "metric_value": primary_value,
+                    "mode": "min",
+                    "count": total_count,
+                    "loader_index": loader_index,
+                    "horizons": horizon_metrics,
+                    "aggregation": aggregation,
+                    "sampler_epoch": int(rollout_promotion_cfg.get("sampler_epoch", 0)),
+                    "seed": int(rollout_promotion_cfg.get("seed", seed + 50_000 + loader_index)),
+                }
+
+                if rollout_only_eval_mode:
+                    if load_path is None:
+                        raise RuntimeError("rollout-only qualification requires a loaded checkpoint")
+
+                    def publish_rollout_qualification():
+                        existing_alias = checkpoint_manager.read_alias("latest", verify=True)
+                        if existing_alias is not None:
+                            reference = existing_alias["checkpoint"]
+                        else:
+                            registered = checkpoint_manager.register_existing(
+                                load_path,
+                                global_update=0,
+                                epoch=None,
+                                metadata={
+                                    "artifact_kind": "released_qualification_checkpoint",
+                                    "source_path": os.path.realpath(load_path),
+                                    "wandb_run_id": trainer.wandb_run_id,
+                                },
+                            )
+                            reference = registered.to_dict()
+                            checkpoint_manager.promote("latest", reference)
+
+                        metric = promotion_metrics["best_rollout"]
+                        promoted = checkpoint_manager.promote(
+                            "best_rollout",
+                            reference,
+                            metric_name=metric["metric_name"],
+                            metric_value=metric["metric_value"],
+                            mode=metric["mode"],
+                            metrics=metric,
+                        )
+                        promotion_config_sha256 = hashlib.sha256(
+                            json.dumps(
+                                rollout_promotion_cfg,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        ).hexdigest()
+                        result = {
+                            "schema_version": 1,
+                            "status": "complete",
+                            "artifact_kind": "released_rollout_qualification",
+                            "checkpoint": reference,
+                            "dataset_fingerprint": (dataset_manifest or {}).get("dataset_fingerprint"),
+                            "promotion_config_sha256": promotion_config_sha256,
+                            "promotion_config": rollout_promotion_cfg,
+                            "selection": metric,
+                            "promoted": bool(promoted),
+                            "wandb_run_id": trainer.wandb_run_id,
+                        }
+                        result_path = os.path.join(
+                            checkpoint_folder,
+                            "qualification_results",
+                            "released_rollout.json",
+                        )
+                        atomic_json_dump(result, result_path)
+                        return result
+
+                    qualification_result = _run_rank0_planning_controller(
+                        rank,
+                        publish_rollout_qualification,
+                        "released rollout qualification publication",
+                    )
+                    if rank == 0 and trainer.use_wandb:
+                        wandb.run.summary["qualification/released_rollout/status"] = "complete"
+                        wandb.run.summary["qualification/released_rollout/checkpoint_sha256"] = (
+                            qualification_result["checkpoint"]["sha256"]
+                        )
+                        wandb.run.summary["qualification/released_rollout/value"] = primary_value
+                if rank == 0 and trainer.use_wandb:
+                    wandb.log(
+                        {
+                            "global_step": (epoch + 1) * ipe,
+                            "promotion/rollout/primary": primary_value,
+                            "promotion/rollout/count": total_count,
+                            **{f"promotion/rollout/{key}": value for key, value in horizon_metrics.items()},
+                        },
+                        step=(epoch + 1) * ipe,
+                    )
+
+            planning_due = bool(cfgs_plan_evals and cfgs_plan_evals.get("eval_cfg_paths")) and (
+                (epoch % eval_freq == 0) or epoch == (num_epochs - 1)
+            )
+
+            # -- Save complete continuation state
+            saved_reference = None
             if not light_eval_only_mode:
-                if epoch % checkpoint_freq == 0 or epoch == (num_epochs - 1):
-                    if rank == 0:
-                        save_checkpoint(epoch + 1, latest_path)
+                if (epoch + 1) % checkpoint_save_every == 0 or epoch == (num_epochs - 1):
+                    saved_reference = save_checkpoint(
+                        epoch + 1,
+                        latest_path,
+                        promotion_metrics=promotion_metrics,
+                        pending_planning=planning_due,
+                    )
+                    if checkpoint_manager is None and rank == 0:
                         if save_every_freq > 0 and epoch % save_every_freq == 0:
                             save_every_file = pref_tag + f"e{epoch}.{latest_format}"
                             save_every_path = os.path.join(checkpoint_folder, save_every_file)
@@ -1432,8 +2238,10 @@ def main(args, resume_preempt=False):
 
             # -- Launch Planning Eval
             if not light_eval_only_mode:
-                if (epoch % eval_freq == 0) or epoch == (num_epochs - 1):
-                    if save_every_freq > 0:
+                if planning_due:
+                    if saved_reference is not None:
+                        checkpoint = saved_reference["relative_path"]
+                    elif save_every_freq > 0:
                         checkpoint = (
                             pref_tag + f"latest.{latest_format}"
                             if epoch == (num_epochs - 1)
@@ -1455,6 +2263,10 @@ def main(args, resume_preempt=False):
                         dset=val_traj_dataset,
                         preprocessor=preprocessor,
                         checkpoint_folder=checkpoint_folder,
+                        checkpoint_reference=saved_reference,
+                        checkpoint_manager=checkpoint_manager,
+                        wandb_trainer=trainer,
+                        final_epoch=epoch == (num_epochs - 1),
                     )
                     world_model.train()
     elif unroll_decode_eval_only_mode:
@@ -1473,6 +2285,32 @@ def main(args, resume_preempt=False):
     else:
         logger.info("Skipping training loop due to plan_only_eval_mode being enabled.")
         checkpoint = pref_tag + f"latest.{latest_format}"
+        evaluation_reference = None
+        if checkpoint_manager is not None:
+            shared_reference = [None]
+            if rank == 0:
+                existing_alias = checkpoint_manager.read_alias("latest", verify=True)
+                if existing_alias is not None:
+                    shared_reference[0] = existing_alias["checkpoint"]
+                elif load_path is not None:
+                    reference = checkpoint_manager.register_existing(
+                        load_path,
+                        global_update=0,
+                        epoch=None,
+                        metadata={
+                            "artifact_kind": "released_qualification_checkpoint",
+                            "source_path": os.path.realpath(load_path),
+                            "wandb_run_id": trainer.wandb_run_id,
+                        },
+                    )
+                    checkpoint_manager.promote("latest", reference)
+                    shared_reference[0] = reference.to_dict()
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.broadcast_object_list(shared_reference, src=0)
+            evaluation_reference = shared_reference[0]
+            if evaluation_reference is None:
+                raise RuntimeError("Plan-only qualification could not register an immutable checkpoint")
+            checkpoint = evaluation_reference["relative_path"]
         launch_planning_evals(
             rank,
             start_epoch,
@@ -1487,6 +2325,10 @@ def main(args, resume_preempt=False):
             dset=val_traj_dataset,
             preprocessor=preprocessor,
             checkpoint_folder=checkpoint_folder,
+            checkpoint_reference=evaluation_reference,
+            checkpoint_manager=checkpoint_manager,
+            wandb_trainer=trainer,
+            final_epoch=True,
         )
 
 
@@ -1504,6 +2346,10 @@ def launch_planning_evals(
     dset=None,
     preprocessor=None,
     checkpoint_folder=None,
+    checkpoint_reference=None,
+    checkpoint_manager=None,
+    wandb_trainer=None,
+    final_epoch=False,
 ):
     """
     Launch planning evaluations for the current training checkpoint.
@@ -1548,10 +2394,32 @@ def launch_planning_evals(
         preprocessor: Optional data preprocessor (for non-separate eval mode)
     """
     eval_cfg_paths = cfgs_plan_evals.get("eval_cfg_paths", None)
+    if eval_cfg_paths is None:
+        return None
+    if isinstance(eval_cfg_paths, (str, bytes)):
+        raise TypeError("evals.eval_cfg_paths must be a sequence of config paths, not a string")
+    eval_cfg_paths = list(eval_cfg_paths)
+    if not eval_cfg_paths:
+        logger.info("No planning evaluation configs are enabled; skipping planning evaluation")
+        return None
+    if any(not isinstance(path, str) or not path.strip() for path in eval_cfg_paths):
+        raise ValueError("evals.eval_cfg_paths must contain only non-empty config paths")
     eval_nodes = cfgs_plan_evals.get("nodes", None)
     eval_episodes = cfgs_plan_evals.get("eval_episodes", None)
     eval_low_pri = cfgs_plan_evals.get("low_pri", True)
     separate = cfgs_plan_evals.get("separate", True)
+
+    def record_planning_promotion(report):
+        if rank != 0 or not report:
+            return
+        promotion = report.get("promotion")
+        if not promotion or not promotion.get("promoted"):
+            return
+        if wandb_trainer is not None and wandb_trainer.use_wandb:
+            winner = promotion["winner"]
+            wandb.run.summary["best_planning/checkpoint_id"] = winner["checkpoint"]["id"]
+            wandb.run.summary["best_planning/value"] = winner["selection"]["value"]
+
     override_cfgs_data = cfgs_plan_evals.get("override_cfgs_data", True)
     override_datasets = cfgs_plan_evals.get("override_datasets", True)
     # task_specification
@@ -1566,6 +2434,33 @@ def launch_planning_evals(
     goal_H = cfgs_plan_evals.get("goal_H", None)
     num_elites = cfgs_plan_evals.get("num_elites", None)
     if eval_cfg_paths is not None:
+        planning_result_dir = (
+            os.path.join(checkpoint_folder, "planning_results")
+            if checkpoint_reference is not None
+            else None
+        )
+        planning_registry_path = (
+            os.path.join(planning_result_dir, "registry.json")
+            if planning_result_dir is not None
+            else None
+        )
+        if checkpoint_reference is not None:
+            if checkpoint_manager is None:
+                raise RuntimeError("strict planning provenance requires a CheckpointManager")
+            pre_launch_report = _run_rank0_planning_controller(
+                rank,
+                lambda: poll_planning_evaluations(
+                    planning_registry_path,
+                    manager=checkpoint_manager,
+                ),
+                "pre-launch planning-evaluation poll",
+            )
+            record_planning_promotion(pre_launch_report)
+        immutable_checkpoint_path = (
+            os.path.join(checkpoint_folder, checkpoint_reference["relative_path"])
+            if checkpoint_reference is not None
+            else None
+        )
         eval_nodes, eval_tasks_per_node, args_eval, eval_cpus_per_task = build_plan_eval_args(
             app_name="vjepa_wm",
             folder=folder,
@@ -1590,7 +2485,28 @@ def launch_planning_evals(
             num_elites=num_elites,
             wrapper_kwargs=cfgs_plan_evals.get("wrapper_kwargs", {}),
             checkpoint_folder=checkpoint_folder,
+            checkpoint_id=(checkpoint_reference or {}).get("object_id"),
+            checkpoint_checksum=(checkpoint_reference or {}).get("sha256"),
+            checkpoint_path=immutable_checkpoint_path,
+            checkpoint_step=(checkpoint_reference or {}).get("global_update"),
+            planning_result_dir=planning_result_dir,
+            planning_eval_id=(
+                f"{(checkpoint_reference or {}).get('object_id', 'legacy')}-epoch-{epoch}"
+                if checkpoint_reference is not None
+                else None
+            ),
         )
+
+        if checkpoint_reference is not None:
+            promotion_eval_index = cfgs_plan_evals.get("promotion_eval_index", 0)
+            if promotion_eval_index is not None:
+                promotion_eval_index = int(promotion_eval_index)
+                if promotion_eval_index < 0 or promotion_eval_index >= len(args_eval):
+                    raise ValueError(
+                        f"promotion_eval_index={promotion_eval_index} is outside the {len(args_eval)} eval configs"
+                    )
+            for index, eval_args in enumerate(args_eval):
+                eval_args["planning_provenance"]["promotion_eligible"] = index == promotion_eval_index
 
         # Dump eval configs if in dump_eval_configs mode (useful for generating configs without training)
         dump_eval_configs = cfgs_plan_evals.get("dump_eval_configs", False)
@@ -1632,6 +2548,18 @@ def launch_planning_evals(
 
             sys.exit(0)
 
+        if checkpoint_reference is not None:
+            provenances = [eval_args["planning_provenance"] for eval_args in args_eval]
+            _run_rank0_planning_controller(
+                rank,
+                lambda: register_planning_evaluations(
+                    planning_registry_path,
+                    provenances,
+                    execution_mode="asynchronous" if separate else "synchronous",
+                ),
+                "planning-evaluation registration",
+            )
+
         for i, cfg in enumerate(args_eval):
             args_eval[i] = convert_to_dict_recursive(args_eval[i])
 
@@ -1653,26 +2581,148 @@ def launch_planning_evals(
                         timeout=120,  # to schedule faster, could be insufficient if using old GPUs making eval slow
                     )
                 logger.info(f"Launched online evals from templates {eval_cfg_paths}")
+            if checkpoint_reference is not None:
+                _run_rank0_planning_controller(
+                    rank,
+                    lambda: mark_planning_evaluations_launched(
+                        planning_registry_path,
+                        checkpoint_reference["object_id"],
+                    ),
+                    "planning-evaluation launch commit",
+                )
         else:
             from app.vjepa_wm.modelcustom.simu_env_planning.vit_enc_preds import EncPredWM
             from evals.simu_env_planning.eval import main_distributed_episodes_eval as gc_main_dist
 
-            world_model.eval()
-            for i, cfg in tqdm(enumerate(args_eval)):
-                eval_tag = cfg.get("tag", None)
-                pretrain_folder = cfg.get("folder", None)
-                folder = os.path.join(pretrain_folder, "simu_env_planning/")
-                if eval_tag is not None:
-                    folder = os.path.join(folder, eval_tag)
-                cfg["frameskip"] = cfg["model_kwargs"]["data"]["custom"]["frameskip"]
-                cfg["work_dir"] = folder
-                model = EncPredWM(
-                    world_model,
-                    action_dim=world_model.action_dim,
-                    preprocessor=preprocessor,
-                    ctxt_window=cfg["model_kwargs"]["wrapper_kwargs"]["ctxt_window"],
+            if checkpoint_reference is not None:
+                _run_rank0_planning_controller(
+                    rank,
+                    lambda: mark_planning_evaluations_launched(
+                        planning_registry_path,
+                        checkpoint_reference["object_id"],
+                    ),
+                    "synchronous planning-evaluation launch commit",
                 )
-                gc_main_dist(cfg, model=model, dset=dset, preprocessor=preprocessor, rank=rank)
+            planning_process_group = None
+            planning_rank_is_active = True
+            inprocess_world_size = cfgs_plan_evals.get("inprocess_world_size")
+            if inprocess_world_size is not None:
+                if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                    raise RuntimeError("evals.inprocess_world_size requires initialized distributed training")
+                inprocess_world_size = int(inprocess_world_size)
+                training_world_size = torch.distributed.get_world_size()
+                if inprocess_world_size <= 0 or inprocess_world_size > training_world_size:
+                    raise ValueError(
+                        "evals.inprocess_world_size must be in [1, training world size]: "
+                        f"got {inprocess_world_size} for world size {training_world_size}"
+                    )
+                # Every training rank must create groups in identical order.
+                # The prefix maps ranks 0..7 to node zero under torchrun, which
+                # exactly matches the released DROID planning topology.
+                planning_process_group = torch.distributed.new_group(
+                    ranks=list(range(inprocess_world_size))
+                )
+                planning_rank_is_active = rank < inprocess_world_size
+
+            training_rng_state = capture_rng_state(rank=rank)
+            try:
+                if planning_rank_is_active:
+                    world_model.eval()
+                    for i, cfg in tqdm(enumerate(args_eval)):
+                        eval_tag = cfg.get("tag", None)
+                        pretrain_folder = cfg.get("folder", None)
+                        folder = os.path.join(pretrain_folder, "simu_env_planning/")
+                        if eval_tag is not None:
+                            folder = os.path.join(folder, eval_tag)
+                        cfg["frameskip"] = cfg["model_kwargs"]["data"]["custom"]["frameskip"]
+                        cfg["work_dir"] = folder
+                        model = EncPredWM(
+                            world_model,
+                            action_dim=world_model.action_dim,
+                            preprocessor=preprocessor,
+                            ctxt_window=cfg["model_kwargs"]["wrapper_kwargs"]["ctxt_window"],
+                        )
+                        planning_metrics = gc_main_dist(
+                            cfg,
+                            model=model,
+                            dset=dset,
+                            preprocessor=preprocessor,
+                            rank=rank,
+                            device=str(model.device),
+                            process_group=planning_process_group,
+                        )
+                        if (
+                            rank == 0
+                            and wandb_trainer is not None
+                            and wandb_trainer.use_wandb
+                            and planning_metrics
+                        ):
+                            provenance = cfg.get("planning_provenance", {})
+                            config_digest = str(provenance.get("eval_config_sha256", f"index-{i}"))
+                            metric_prefix = f"planning/{config_digest[:16]}"
+                            wandb_step = int(
+                                (checkpoint_reference or {}).get("global_update")
+                                if (checkpoint_reference or {}).get("global_update") is not None
+                                else epoch
+                            )
+                            scalar_metrics = {
+                                f"{metric_prefix}/{key}": float(value)
+                                for key, value in planning_metrics.items()
+                                if isinstance(value, (int, float, np.number)) and not isinstance(value, bool)
+                            }
+                            wandb.log(
+                                {
+                                    "global_step": wandb_step,
+                                    f"{metric_prefix}/complete": 1,
+                                    **scalar_metrics,
+                                },
+                                step=wandb_step,
+                            )
+                            wandb.run.summary[f"{metric_prefix}/checkpoint_id"] = (
+                                checkpoint_reference or {}
+                            ).get("object_id")
+                if planning_process_group is not None:
+                    # Non-planning ranks wait here; planning collectives above
+                    # use only the 8-rank subgroup and cannot strand them.
+                    torch.distributed.barrier()
+            finally:
+                # Planning reseeds Python/NumPy/torch and consumes CUDA RNG.
+                # Restore each training rank independently so an uninterrupted
+                # next epoch matches continuation from the just-saved state.
+                restore_rng_state(training_rng_state, strict_cuda=True)
+                if planning_process_group is not None and planning_rank_is_active:
+                    torch.distributed.destroy_process_group(planning_process_group)
+
+        if checkpoint_reference is not None:
+            final_drain_timeout = float(cfgs_plan_evals.get("final_drain_timeout_seconds", 4 * 60 * 60))
+            final_drain_interval = float(cfgs_plan_evals.get("final_drain_poll_interval_seconds", 10.0))
+            final_drain_required = bool(cfgs_plan_evals.get("final_drain_required", True))
+            if final_epoch:
+                if separate and final_drain_required and final_drain_timeout <= 0:
+                    raise ValueError(
+                        "asynchronous final planning drain requires final_drain_timeout_seconds > 0"
+                    )
+                controller_report = _run_rank0_planning_controller(
+                    rank,
+                    lambda: drain_planning_evaluations(
+                        planning_registry_path,
+                        manager=checkpoint_manager,
+                        timeout_seconds=final_drain_timeout,
+                        poll_interval_seconds=final_drain_interval,
+                        raise_on_timeout=final_drain_required,
+                    ),
+                    "final planning-evaluation drain",
+                )
+            else:
+                controller_report = _run_rank0_planning_controller(
+                    rank,
+                    lambda: poll_planning_evaluations(
+                        planning_registry_path,
+                        manager=checkpoint_manager,
+                    ),
+                    "post-launch planning-evaluation poll",
+                )
+            record_planning_promotion(controller_report)
 
 
 def launch_unroll_decode_eval(

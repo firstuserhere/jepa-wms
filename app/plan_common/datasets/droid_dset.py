@@ -30,7 +30,9 @@ decord.bridge.set_bridge("native")
 
 
 def get_json(directory):
-    for filename in os.listdir(directory):
+    # Match the manifest builder's deterministic metadata selection.  Filesystem
+    # enumeration order is not stable across cached/object-store mounts.
+    for filename in sorted(os.listdir(directory)):
         if filename.endswith(".json"):
             file_path = os.path.join(directory, filename)
             try:

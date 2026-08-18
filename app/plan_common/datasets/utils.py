@@ -5,10 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 #
 
+import random
 from logging import getLogger
 from typing import Callable
 
 import decord
+import numpy as np
 import torch
 import torch.utils.data
 
@@ -25,6 +27,25 @@ from .wall_dset import load_wall_slice_train_val
 
 _GLOBAL_SEED = 0
 logger = getLogger()
+
+
+def seed_data_worker(worker_id):
+    """Seed every RNG used by a loader worker, including DROID's local RNG.
+
+    ``torch.initial_seed`` is derived from the DataLoader generator, so this is
+    reproducible when the generator is reseeded at an epoch boundary.
+    """
+
+    del worker_id
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    worker_info = torch.utils.data.get_worker_info()
+    worker_dataset = None if worker_info is None else worker_info.dataset
+    while worker_dataset is not None:
+        if hasattr(worker_dataset, "rng"):
+            worker_dataset.rng = np.random.RandomState(worker_seed)
+        worker_dataset = getattr(worker_dataset, "dataset", None)
 
 
 def init_data(
@@ -233,6 +254,8 @@ def init_data(
             rank=rank,
             shuffle=shuffle,
         )
+        train_generator = torch.Generator()
+        train_generator.manual_seed(seed + rank)
         data_loader = torch.utils.data.DataLoader(
             dataset,
             collate_fn=collator,
@@ -242,6 +265,8 @@ def init_data(
             pin_memory=pin_mem,
             num_workers=num_workers,
             persistent_workers=(num_workers > 0) and persistent_workers,
+            generator=train_generator,
+            worker_init_fn=seed_data_worker,
         )
         val_dist_sampler = torch.utils.data.distributed.DistributedSampler(
             datasets["valid"],
@@ -249,6 +274,8 @@ def init_data(
             rank=rank,
             shuffle=shuffle,
         )
+        val_generator = torch.Generator()
+        val_generator.manual_seed(seed + 10_000 + rank)
         val_data_loader = torch.utils.data.DataLoader(
             datasets["valid"],
             collate_fn=collator,
@@ -258,6 +285,8 @@ def init_data(
             pin_memory=pin_mem,
             num_workers=num_workers,
             persistent_workers=(num_workers > 0) and persistent_workers,
+            generator=val_generator,
+            worker_init_fn=seed_data_worker,
         )
         logger.info("VideoDataset unsupervised data loader created")
         if rank == 0 and val_viz_rank0_loader:
@@ -271,6 +300,8 @@ def init_data(
                 pin_memory=pin_mem,
                 num_workers=num_workers,
                 persistent_workers=(num_workers > 0) and persistent_workers,
+                generator=torch.Generator().manual_seed(seed + 20_000),
+                worker_init_fn=seed_data_worker,
             )
             logger.info("Created non-distributed validation loader for visualization")
         else:

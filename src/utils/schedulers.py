@@ -8,6 +8,16 @@
 import math
 
 
+def _load_schedule_state(schedule, state_dict, fields):
+    """Restore a schedule without advancing it or mutating the optimizer."""
+
+    if not hasattr(state_dict, "items"):
+        raise TypeError("scheduler state_dict must be a mapping")
+    for field in fields:
+        if field in state_dict:
+            setattr(schedule, field, state_dict[field])
+
+
 class WSDSchedule(object):
 
     def __init__(self, optimizer, warmup_steps, anneal_steps, T_max, start_lr, ref_lr, final_lr=0.0):
@@ -39,6 +49,24 @@ class WSDSchedule(object):
 
         return new_lr
 
+    def state_dict(self):
+        return {
+            "start_lr": self.start_lr,
+            "ref_lr": self.ref_lr,
+            "final_lr": self.final_lr,
+            "anneal_steps": self.anneal_steps,
+            "warmup_steps": self.warmup_steps,
+            "T_max": self.T_max,
+            "_step": self._step,
+        }
+
+    def load_state_dict(self, state_dict):
+        _load_schedule_state(
+            self,
+            state_dict,
+            ("start_lr", "ref_lr", "final_lr", "anneal_steps", "warmup_steps", "T_max", "_step"),
+        )
+
 
 class WarmupCosineSchedule(object):
 
@@ -69,6 +97,23 @@ class WarmupCosineSchedule(object):
 
         return new_lr
 
+    def state_dict(self):
+        return {
+            "start_lr": self.start_lr,
+            "ref_lr": self.ref_lr,
+            "final_lr": self.final_lr,
+            "warmup_steps": self.warmup_steps,
+            "T_max": self.T_max,
+            "_step": self._step,
+        }
+
+    def load_state_dict(self, state_dict):
+        _load_schedule_state(
+            self,
+            state_dict,
+            ("start_lr", "ref_lr", "final_lr", "warmup_steps", "T_max", "_step"),
+        )
+
 
 class CosineWDSchedule(object):
 
@@ -94,6 +139,17 @@ class CosineWDSchedule(object):
                 group["weight_decay"] = new_wd
         return new_wd
 
+    def state_dict(self):
+        return {
+            "ref_wd": self.ref_wd,
+            "final_wd": self.final_wd,
+            "T_max": self.T_max,
+            "_step": self._step,
+        }
+
+    def load_state_dict(self, state_dict):
+        _load_schedule_state(self, state_dict, ("ref_wd", "final_wd", "T_max", "_step"))
+
 
 class LinearDecaySchedule(object):
 
@@ -112,3 +168,14 @@ class LinearDecaySchedule(object):
             group["lr"] = new_lr
 
         return new_lr
+
+    def state_dict(self):
+        return {
+            "ref_lr": self.ref_lr,
+            "final_lr": self.final_lr,
+            "max_steps": self.max_steps,
+            "_step": self._step,
+        }
+
+    def load_state_dict(self, state_dict):
+        _load_schedule_state(self, state_dict, ("ref_lr", "final_lr", "max_steps", "_step"))

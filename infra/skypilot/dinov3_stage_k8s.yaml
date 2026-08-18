@@ -1,0 +1,58 @@
+name: jepawm-stage-dinov3-native
+num_nodes: 1
+
+resources:
+  infra: k8s/Skypilot
+  cpus: 8+
+  memory: 32+
+  disk_size: 20
+  job_recovery:
+    strategy: FAILOVER
+    max_restarts_on_errors: 3
+
+workdir: .
+api_server_access: false
+
+envs:
+  DINOV3_WEIGHTS_SHA256: REPLACE_WITH_FULL_SHA256
+
+secrets:
+  # The access-form email supplies a private native-weight URL. Store it as a
+  # managed Sky secret; never place it in YAML, shell history, or W&B.
+  - secrets:DINOV3_WEIGHTS_URL
+
+volumes:
+  /mnt/jepawm-checkpoints: replace-me-jepawm-checkpoints
+
+setup: |
+  set -euo pipefail
+  command -v wget >/dev/null
+
+run: |
+  set -euo pipefail
+  : "${DINOV3_WEIGHTS_URL:?DINOV3_WEIGHTS_URL managed secret is required}"
+  if [[ ! "$DINOV3_WEIGHTS_SHA256" =~ ^8aa4cbdd[[:xdigit:]]{56}$ ]]; then
+    echo "Expected the full native DINOv3 ViT-L/16 SHA-256" >&2
+    exit 2
+  fi
+  destination_dir=/mnt/jepawm-checkpoints/artifacts/dinov3
+  destination="$destination_dir/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+  mkdir -p "$destination_dir"
+  if [[ -f "$destination" ]] && \
+     [[ "$(sha256sum "$destination" | awk '{print $1}')" == "$DINOV3_WEIGHTS_SHA256" ]]; then
+    echo "Verified native DINOv3 artifact is already staged"
+    exit 0
+  fi
+  temporary="$(mktemp "$destination_dir/.dinov3-vitl16.${SKYPILOT_TASK_ID}.XXXXXX")"
+  trap 'rm -f "$temporary"' EXIT
+  # Quiet mode prevents an access URL/query string from appearing in logs.
+  wget -q --tries=5 --timeout=60 -O "$temporary" "$DINOV3_WEIGHTS_URL"
+  actual_sha256="$(sha256sum "$temporary" | awk '{print $1}')"
+  if [[ "$actual_sha256" != "$DINOV3_WEIGHTS_SHA256" ]]; then
+    echo "Downloaded native DINOv3 artifact failed SHA-256 verification" >&2
+    exit 2
+  fi
+  sync "$temporary"
+  mv "$temporary" "$destination"
+  trap - EXIT
+  printf '%s  %s\n' "$actual_sha256" "$(basename "$destination")" > "$destination.sha256"

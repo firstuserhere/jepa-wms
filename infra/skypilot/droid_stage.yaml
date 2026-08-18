@@ -1,0 +1,140 @@
+name: jepawm-stage-droid-raw
+num_nodes: 1
+
+resources:
+  cloud: gcp
+  cpus: 64+
+  memory: 256+
+  disk_size: 512
+  disk_tier: best
+  use_spot: true
+  job_recovery:
+    strategy: EAGER_NEXT_REGION
+    max_restarts_on_errors: 5
+
+workdir: .
+
+envs:
+  DROID_STORE_URI: gs://replace-me-jepawm-datasets
+  JEPAWM_STORAGE_BACKEND: gcs
+  DROID_VOLUME_NAME: ""
+
+secrets:
+  - secrets:HF_TOKEN
+
+file_mounts:
+  # The target must exist before submission.  After rsync completes, verify
+  # every episode through a close-to-open read-only mount before publishing
+  # the strict training manifest.
+  /mnt/jepawm-datasets:
+    source: ${DROID_STORE_URI}
+    mode: MOUNT
+    persistent: true
+    config:
+      mount:
+        read_only: true
+
+setup: |
+  bash infra/skypilot/setup_stage.sh
+
+run: |
+  set -euo pipefail
+  export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+  if [[ "$JEPAWM_STORAGE_BACKEND" == gcs ]]; then
+    test -n "$DROID_STORE_URI"
+    droid_target="$DROID_STORE_URI/droid_raw"
+  elif [[ "$JEPAWM_STORAGE_BACKEND" == pvc ]]; then
+    test -n "$DROID_VOLUME_NAME"
+    test -d /mnt/jepawm-datasets
+    droid_target=/mnt/jepawm-datasets/droid_raw
+  else
+    echo "JEPAWM_STORAGE_BACKEND must be gcs or pvc" >&2
+    exit 2
+  fi
+  gsutil -m rsync -d -r \
+    -x '.*SVO.*|.*stereo.*\.mp4$' \
+    gs://gresearch/robotics/droid_raw \
+    "$droid_target"
+
+  franka_cache="$(mktemp -d)"
+  trap 'rm -rf "$franka_cache"' EXIT
+  hf download facebook/jepa-wms \
+    --type dataset \
+    --revision 6116f042ae7ae4c8e3f1fd2f194f432615664182 \
+    --include 'franka_custom/*' \
+    --local-dir "$franka_cache"
+  if [[ "$JEPAWM_STORAGE_BACKEND" == gcs ]]; then
+    gsutil -m rsync -d -r "$franka_cache/franka_custom" "$DROID_STORE_URI/franka_custom"
+  else
+    gsutil -m rsync -d -r "$franka_cache/franka_custom" /mnt/jepawm-datasets/franka_custom
+  fi
+
+  verification_dir="$(mktemp -d)"
+  trap 'rm -rf "$franka_cache" "$verification_dir"' EXIT
+  if [[ "$JEPAWM_STORAGE_BACKEND" == gcs ]]; then
+    python3 infra/skypilot/stage_droid.py \
+      --target-uri "$DROID_STORE_URI" \
+      --expected-source-root-uri gs://gresearch/robotics \
+      --mount-root /mnt/jepawm-datasets \
+      --min-episodes 74000 \
+      --output-dir "$verification_dir"
+  else
+    python3 infra/skypilot/stage_droid.py \
+      --target-root /mnt/jepawm-datasets \
+      --staged-identity "sky-volume://$DROID_VOLUME_NAME/droid_raw/1.0.1" \
+      --expected-source-root-uri gs://gresearch/robotics \
+      --mount-root /mnt/jepawm-datasets \
+      --min-episodes 74000 \
+      --output-dir "$verification_dir"
+  fi
+
+  python3 src/scripts/build_droid_manifest.py \
+    --paths "$verification_dir/droid_paths.csv" \
+    --droid-root /mnt/jepawm-datasets/droid_raw/1.0.1 \
+    --output "$verification_dir/droid_manifest.json" \
+    --source-uri gs://gresearch/robotics/droid_raw/1.0.1 \
+    --source-index-manifest "$verification_dir/droid_index_manifest.json" \
+    --dataset-version 1.0.1 \
+    --camera-key left_mp4_path
+
+  # Bind the exact held-out Franka_hf bytes used by rollout/planning promotion
+  # into the same fingerprint.  Compare the staged read-only tree byte-for-byte
+  # with the pinned Hub checkout before publishing anything.
+  python3 infra/skypilot/stage_droid.py \
+    --bind-franka-manifest "$verification_dir/droid_manifest.json" \
+    --franka-source-root "$franka_cache/franka_custom" \
+    --franka-staged-root /mnt/jepawm-datasets/franka_custom
+
+  python3 - "$verification_dir/droid_manifest.json" <<'PY'
+  import json
+  import sys
+
+  with open(sys.argv[1], "r", encoding="utf-8") as stream:
+      manifest = json.load(stream)
+  verification = manifest.get("verification", {})
+  auxiliary = manifest.get("auxiliary_datasets", {}).get("Franka_hf", {})
+  if (
+      verification.get("files_checked") is not True
+      or verification.get("complete") is not True
+      or verification.get("source_listing_matches_staged") is not True
+      or verification.get("auxiliary_files_checked") is not True
+      or auxiliary.get("hub_revision") != "6116f042ae7ae4c8e3f1fd2f194f432615664182"
+      or auxiliary.get("verification", {}).get("source_tree_matches_staged") is not True
+  ):
+      raise SystemExit("Combined DROID + Franka_hf full-file verification did not pass")
+  PY
+
+  if [[ "$JEPAWM_STORAGE_BACKEND" == gcs ]]; then
+    gsutil -m cp \
+      "$verification_dir/droid_paths.csv" \
+      "$verification_dir/droid_manifest.json" \
+      "$DROID_STORE_URI/DROID/"
+  else
+    mkdir -p /mnt/jepawm-datasets/DROID
+    for artifact in droid_paths.csv droid_manifest.json; do
+      temporary="/mnt/jepawm-datasets/DROID/.${artifact}.${SKYPILOT_TASK_ID}.tmp"
+      cp "$verification_dir/$artifact" "$temporary"
+      sync "$temporary"
+      mv "$temporary" "/mnt/jepawm-datasets/DROID/$artifact"
+    done
+  fi

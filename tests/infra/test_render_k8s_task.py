@@ -1,0 +1,64 @@
+from infra.skypilot.render_k8s_task import render_k8s_task
+
+
+def _base_task():
+    return {
+        "name": "test",
+        "num_nodes": 4,
+        "resources": {
+            "cloud": "gcp",
+            "accelerators": "H200:8",
+            "disk_size": 3000,
+            "disk_tier": "best",
+            "network_tier": "best",
+            "use_spot": True,
+            "job_recovery": {"strategy": "EAGER_NEXT_REGION", "max_restarts_on_errors": 3},
+        },
+        "envs": {"DROID_STORE_URI": "gs://data", "CHECKPOINT_STORE_URI": "gs://checkpoints"},
+        "file_mounts": {
+            "/mnt/jepawm-datasets": {"source": "${DROID_STORE_URI}"},
+            "/mnt/jepawm-checkpoints": {"source": "${CHECKPOINT_STORE_URI}"},
+        },
+    }
+
+
+def test_k8s_profile_replaces_only_provider_and_storage_plumbing():
+    rendered = render_k8s_task(
+        _base_task(),
+        droid_volume="jepawm-droid",
+        checkpoint_volume="jepawm-checkpoints",
+        context="Skypilot",
+    )
+
+    assert rendered["num_nodes"] == 4
+    assert rendered["resources"]["accelerators"] == "H200:8"
+    assert rendered["resources"]["infra"] == "k8s/Skypilot"
+    assert rendered["resources"]["job_recovery"]["strategy"] == "FAILOVER"
+    assert "cloud" not in rendered["resources"]
+    assert "file_mounts" not in rendered
+    assert rendered["volumes"] == {
+        "/mnt/jepawm-datasets": "jepawm-droid",
+        "/mnt/jepawm-checkpoints": "jepawm-checkpoints",
+    }
+    assert rendered["envs"]["JEPAWM_STORAGE_BACKEND"] == "pvc"
+    assert rendered["envs"]["DINOV3_WEIGHTS_SOURCE_PATH"].startswith(
+        "/mnt/jepawm-checkpoints/artifacts/"
+    )
+    assert rendered["api_server_access"] is False
+
+
+def test_k8s_profile_rejects_missing_or_unsafe_volume_names():
+    task = _base_task()
+    try:
+        render_k8s_task(task, droid_volume=None, checkpoint_volume="checkpoints", context="Skypilot")
+    except ValueError as error:
+        assert "droid-volume" in str(error)
+    else:
+        raise AssertionError("missing DROID volume was accepted")
+
+    try:
+        render_k8s_task(task, droid_volume="DROID VOLUME", checkpoint_volume="checkpoints", context="Skypilot")
+    except ValueError as error:
+        assert "DNS-style" in str(error)
+    else:
+        raise AssertionError("unsafe DROID volume was accepted")

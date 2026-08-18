@@ -1,0 +1,58 @@
+# Operational overlay only. Scientific hyperparameters are inherited unchanged
+# from the released JEPA-WM DROID baseline below.
+base_config: ../../configs/vjepa_wm/droid_final_sweep/droid_4fpcs_fps4_r256_dv3vitl_asp1_pred_AdaLN_depth12_noprop_repro_2roll_4n.yaml
+
+overrides:
+  # JEPAWM_RUN_ID defaults to the stable SkyPilot task ID.  A caller may set
+  # it explicitly only when deliberately continuing a named run.
+  folder: ${JEPAWM_LOGS}/${JEPAWM_RUN_ID}
+  checkpoint_folder: ${JEPAWM_CKPT}/${JEPAWM_RUN_ID}
+  checkpointing:
+    enabled: true
+    strict_continuation: true
+    require_dataset_manifest: true
+    require_source_inventory: true
+    require_git_manifest: true
+    dataset_manifest_path: ${JEPAWM_DSET}/DROID/droid_manifest.json
+    save_every_epochs: 1
+    # Independent crash-recovery fallbacks, in addition to semantic best roles.
+    keep_recent: 3
+    keep_pending_planning: true
+    # Fixed best_rollout promotion corpus: baseline validation loader 0
+    # (Franka_hf, 5 frames, exterior_image_2_left), on the 32-rank quality
+    # topology.  Never let training-time sampler progress select this slice.
+    rollout_promotion:
+      enabled: true
+      every_epochs: 1
+      loader_index: 0
+      sampler_epoch: 0
+      seed: 50234
+      max_batches: 64
+      horizons: [1, 2, 3, 4]
+      aggregation: mean
+      metric_base: data_traj/val_rollout/visual_l2_loss
+  data:
+    loader:
+      # Recreating workers at epoch boundaries makes sampler/RNG restoration
+      # deterministic after managed-job recovery.
+      persistent_workers: false
+  logging:
+    wandb:
+      use_wandb: true
+      required: true
+      required_online: true
+  model:
+    visual_encoder:
+      pretrain_enc_path: ${DINOV3_WEIGHTS_PATH}
+      pretrain_enc_sha256: ${DINOV3_WEIGHTS_SHA256}
+      pretrain_enc_repo_path: ${DINOV3_REPO_PATH}
+      pretrain_enc_repo_revision: 54694f7627fd815f62a5dcc82944ffa6153bbb76
+  evals:
+    # SkyPilot does not provide the Slurm/Submitit scheduler used upstream.
+    # Keep one canonical suite synchronous. Only ranks 0..7 participate in
+    # planning, exactly matching the released 1-node/8-rank seed topology;
+    # the remaining training ranks wait without entering planner collectives.
+    separate: false
+    inprocess_world_size: 8
+    eval_cfg_paths:
+      - configs/online_plan_evals/droid/droid_L2_cem_sourcedset_H3_nas3_maxnorm01_ctxt2_gH3.yaml

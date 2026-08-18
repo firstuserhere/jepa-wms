@@ -1,0 +1,30 @@
+base_config: droid_dinov3_quality_overlay.yaml
+
+overrides:
+  folder: ${JEPAWM_LOGS}/qualification/${JEPAWM_RUN_ID}/released_droid/rollout
+  checkpoint_folder: ${JEPAWM_CKPT}/qualification/${JEPAWM_RUN_ID}/released_droid/rollout
+  checkpointing:
+    # The released artifact predates the resumable-v2 schema.  Qualification
+    # is read-only; newly trained checkpoints remain strict.
+    enabled: true
+    strict_continuation: false
+    require_dataset_manifest: true
+    dataset_manifest_path: ${JEPAWM_DSET}/DROID/droid_manifest.json
+  meta:
+    plan_only_eval_mode: false
+    light_eval_only_mode: true
+    # One-shot, no-gradient qualification of the released artifact using the
+    # exact fixed held-out rollout corpus used for best_rollout selection.
+    rollout_only_eval_mode: true
+    quick_debug: false
+    load_checkpoint: true
+    load_opt_scale_epoch: false
+    strict_checkpoint_weights: true
+    pretrained_path: ${RELEASED_DROID_CHECKPOINT_PATH}
+    light_eval_freq: 1
+  evals:
+    separate: false
+  optimization:
+    transition_model:
+      num_epochs: 1
+      iterations_per_epoch: 1

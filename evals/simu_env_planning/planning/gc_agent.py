@@ -31,7 +31,7 @@ class GC_Agent:
 
     def __init__(self, cfg, model, dset=None, preprocessor=None):
         self.cfg = cfg
-        self.device = torch.device("cuda", index=0)
+        self.device = torch.device(cfg.device)
         logger.info("🏗️  Initializing GC_Agent with WorldModel")
         self.model = model
         self.dset = dset
@@ -40,7 +40,7 @@ class GC_Agent:
                 self.dset.frames_per_clip = cfg.frameskip * cfg.task_specification.goal_H + 1
         self.preprocessor = preprocessor
         self.local_generator = torch.Generator(device="cpu")
-        self.local_gpu_generator = torch.Generator(device="cuda:0")
+        self.local_gpu_generator = torch.Generator(device=self.device)
         self.local_generator.manual_seed(cfg.local_seed)
         self.local_gpu_generator.manual_seed(cfg.local_seed)
 
