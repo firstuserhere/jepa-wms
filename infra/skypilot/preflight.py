@@ -257,6 +257,11 @@ def validate_overlays() -> None:
 def validate_local_syntax() -> None:
     if not (REPO_ROOT / "uv.lock").is_file():
         raise AssertionError("uv.lock is required for frozen reproducible worker installs")
+    smoke_setup = (INFRA_DIR / "setup_smoke.sh").read_text(encoding="utf-8")
+    if '"numpy==2.2.6"' not in smoke_setup:
+        raise AssertionError(
+            "Distributed smoke setup must install pinned NumPy for torch all_gather_object"
+        )
     launch_text = (INFRA_DIR / "launch.sh").read_text(encoding="utf-8")
     if 'priority_class="p1"' not in launch_text:
         raise AssertionError("P1 must remain the default launch priority")

@@ -15,4 +15,8 @@ test "$(git rev-parse HEAD)" = "$GIT_COMMIT_HASH"
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
 uv venv --python 3.10
-uv pip install --python .venv/bin/python "torch==2.7.0" wandb
+# `torch.distributed.all_gather_object()` converts its payload tensor through
+# NumPy during deserialization. Keep this explicit in the minimal smoke env so
+# the recovery gate exercises collectives instead of failing on an optional
+# local dependency.
+uv pip install --python .venv/bin/python "torch==2.7.0" "numpy==2.2.6" wandb

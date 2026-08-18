@@ -210,3 +210,10 @@ def test_runtime_smokes_publish_two_node_recovery_evidence():
     assert training_task["run"].rindex("runtime_readiness.py publish") > training_task["run"].index(
         "torchrun"
     )
+
+
+def test_distributed_smoke_installs_numpy_for_object_collectives():
+    setup = (REPO_ROOT / "infra/skypilot/setup_smoke.sh").read_text(encoding="utf-8")
+
+    assert '"torch==2.7.0"' in setup
+    assert '"numpy==2.2.6"' in setup
