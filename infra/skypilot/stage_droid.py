@@ -16,6 +16,53 @@ from pathlib import Path
 GS_URI = re.compile(r"^gs://[a-z0-9][a-z0-9._-]{1,221}[a-z0-9](?:/[A-Za-z0-9._~!$&'()+,;=:@%/-]+)?$")
 FRANKA_REPOSITORY = "facebook/jepa-wms"
 FRANKA_REVISION = "6116f042ae7ae4c8e3f1fd2f194f432615664182"
+RCLONE_VERSION = "v1.73.5"
+RCLONE_LOCAL_ENCODING = "Slash,Colon,InvalidUtf8,Dot"
+ASCII_COLON = ":"
+FULLWIDTH_COLON = "："
+
+
+def encode_source_episode_id(episode_id: str) -> str:
+    """Return the collision-safe local ID produced by rclone's Colon encoding.
+
+    Crusoe SharedFS rejects U+003A in path components.  We deliberately reject a
+    source ID that already contains rclone's U+FF1A replacement instead of guessing
+    at an escape rule; this keeps the source-to-staged mapping auditable and bijective.
+    """
+
+    if FULLWIDTH_COLON in episode_id:
+        raise ValueError(
+            "Official DROID episode ID already contains the reserved U+FF1A "
+            f"path-encoding character: {episode_id!r}"
+        )
+    return episode_id.replace(ASCII_COLON, FULLWIDTH_COLON)
+
+
+def encode_source_episode_ids(episode_ids: list[str]) -> list[str]:
+    encoded = [encode_source_episode_id(episode_id) for episode_id in episode_ids]
+    if len(encoded) != len(set(encoded)):
+        collisions: dict[str, list[str]] = {}
+        for source, staged in zip(episode_ids, encoded):
+            collisions.setdefault(staged, []).append(source)
+        preview = [values for values in collisions.values() if len(values) > 1][:3]
+        raise ValueError(f"DROID path encoding is not bijective; collisions={preview}")
+    return encoded
+
+
+def _path_encoding_descriptor(encoded: bool) -> dict[str, object]:
+    if not encoded:
+        return {"scheme": "identity", "schema_version": 1}
+    return {
+        "scheme": "rclone-local-colon",
+        "schema_version": 1,
+        "implementation": "rclone",
+        "rclone_version": RCLONE_VERSION,
+        "local_encoding": RCLONE_LOCAL_ENCODING,
+        "source_codepoint": "U+003A",
+        "staged_codepoint": "U+FF1A",
+        "preexisting_staged_codepoint_rejected": True,
+        "reversible_for_verified_source_inventory": True,
+    }
 
 
 def validate_gs_uri(value: str) -> str:
@@ -205,12 +252,18 @@ def write_artifacts(
         raise RuntimeError(f"Only {len(episode_ids)} DROID episodes found; expected at least {min_episodes}")
 
     source_inventory = None
+    path_encoding = _path_encoding_descriptor(target_root is not None)
     if expected_source_root_uri is not None:
         expected_source_root_uri = validate_gs_uri(expected_source_root_uri)
         source_episode_ids = list_episode_ids_gcs(expected_source_root_uri)
-        if episode_ids != source_episode_ids:
+        expected_staged_ids = (
+            encode_source_episode_ids(source_episode_ids)
+            if target_root is not None
+            else source_episode_ids
+        )
+        if episode_ids != expected_staged_ids:
             staged = set(episode_ids)
-            source = set(source_episode_ids)
+            source = set(expected_staged_ids)
             missing = sorted(source - staged)
             extra = sorted(staged - source)
             raise RuntimeError(
@@ -221,6 +274,7 @@ def write_artifacts(
             "root_uri": f"{expected_source_root_uri}/droid_raw/1.0.1",
             "episode_count": len(source_episode_ids),
             "canonical_episode_ids_sha256": _episode_ids_sha256(source_episode_ids),
+            "staged_episode_ids_sha256": _episode_ids_sha256(expected_staged_ids),
             "listed_at_utc": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -247,6 +301,7 @@ def write_artifacts(
         "episode_count": len(episode_ids),
         "camera_key": "left_mp4_path",
         "copy_exclude_regex": r".*SVO.*|.*stereo.*\.mp4$",
+        "path_encoding": path_encoding,
         "canonical_episode_ids_sha256": identity.hexdigest(),
         "source_inventory": source_inventory,
         "path_list_sha256": hashlib.sha256(paths_file.read_bytes()).hexdigest(),

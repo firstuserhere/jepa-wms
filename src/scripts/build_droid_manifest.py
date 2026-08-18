@@ -132,19 +132,31 @@ def build_manifest(
                 missing.append({"episode_id": episode_id, "error": str(exc)})
 
     source_inventory = None
+    path_encoding = None
     source_listing_matches_staged = None
     if source_index_manifest is not None:
         with source_index_manifest.open("r", encoding="utf-8") as stream:
             source_index = json.load(stream)
         source_inventory = source_index.get("source_inventory")
+        path_encoding = source_index.get("path_encoding") or {
+            "scheme": "identity",
+            "schema_version": 1,
+        }
         expected_hash = _sha256_bytes(identity_lines)
+        source_staged_hash = (
+            source_inventory.get("staged_episode_ids_sha256")
+            if isinstance(source_inventory, dict)
+            else None
+        )
         source_listing_matches_staged = bool(
             source_index.get("verification", {}).get("source_listing_matches_staged")
             and source_index.get("episode_count") == len(episode_ids)
             and source_index.get("canonical_episode_ids_sha256") == expected_hash
             and isinstance(source_inventory, dict)
             and source_inventory.get("episode_count") == len(episode_ids)
-            and source_inventory.get("canonical_episode_ids_sha256") == expected_hash
+            and (source_staged_hash or source_inventory.get("canonical_episode_ids_sha256"))
+            == expected_hash
+            and isinstance(path_encoding, dict)
         )
         if not source_listing_matches_staged:
             raise ValueError("Source inventory manifest does not match the verified staged episode list")
@@ -163,6 +175,7 @@ def build_manifest(
         "episode_count": len(episode_ids),
         "camera_key": camera_key,
         "source_inventory": source_inventory,
+        "path_encoding": path_encoding,
         "verification": {
             "files_checked": verify_files,
             "verified_episode_count": verified,
@@ -191,8 +204,15 @@ def build_manifest(
     if source_inventory is not None:
         identity["source_inventory"] = {
             key: source_inventory[key]
-            for key in ("root_uri", "episode_count", "canonical_episode_ids_sha256")
+            for key in (
+                "root_uri",
+                "episode_count",
+                "canonical_episode_ids_sha256",
+                "staged_episode_ids_sha256",
+            )
+            if key in source_inventory
         }
+        identity["path_encoding"] = path_encoding
     manifest["dataset_fingerprint"] = _sha256_bytes(
         [json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")]
     )

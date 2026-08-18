@@ -101,6 +101,45 @@ def test_manifest_binds_matching_official_source_inventory(tmp_path):
         build_manifest(paths, root, source_index_manifest=source_index)
 
 
+def test_manifest_binds_encoded_staged_ids_to_original_source_inventory(tmp_path):
+    root = tmp_path / "root"
+    staged_id = "lab/Fri_Aug_18_11：43：44_2023"
+    episode = _make_episode(root, staged_id)
+    paths = tmp_path / "paths.csv"
+    paths.write_text(f"{episode}\n", encoding="utf-8")
+    source_id = "lab/Fri_Aug_18_11:43:44_2023"
+    source_hash = hashlib.sha256(f"{source_id}\n".encode()).hexdigest()
+    staged_hash = hashlib.sha256(f"{staged_id}\n".encode()).hexdigest()
+    source_index = tmp_path / "source-index.json"
+    source_index.write_text(
+        json.dumps(
+            {
+                "episode_count": 1,
+                "canonical_episode_ids_sha256": staged_hash,
+                "path_encoding": {
+                    "scheme": "rclone-local-colon",
+                    "rclone_version": "v1.73.5",
+                },
+                "source_inventory": {
+                    "root_uri": "gs://gresearch/robotics/droid_raw/1.0.1",
+                    "episode_count": 1,
+                    "canonical_episode_ids_sha256": source_hash,
+                    "staged_episode_ids_sha256": staged_hash,
+                },
+                "verification": {"source_listing_matches_staged": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = build_manifest(paths, root, source_index_manifest=source_index)
+
+    assert manifest["verification"]["source_listing_matches_staged"] is True
+    assert manifest["canonical_episode_ids_sha256"] == staged_hash
+    assert manifest["source_inventory"]["canonical_episode_ids_sha256"] == source_hash
+    assert manifest["path_encoding"]["scheme"] == "rclone-local-colon"
+
+
 def test_atomic_json_write(tmp_path):
     output = tmp_path / "nested" / "manifest.json"
     atomic_write_json({"value": 3}, output)

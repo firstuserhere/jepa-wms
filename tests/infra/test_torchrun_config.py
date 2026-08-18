@@ -246,3 +246,8 @@ def test_pvc_staging_creates_and_checks_local_rsync_targets():
     assert 'franka_target=/mnt/jepawm-datasets/franka_custom' in run
     assert 'mkdir -p "$droid_target" "$franka_target"' in run
     assert 'gsutil -m rsync -d -r "$franka_cache/franka_custom" "$franka_target"' in run
+    assert "rclone-v1.73.5-linux-amd64.zip" in run
+    assert "932cf4b7484de74d82b4875488e0009469fd21f9904673385184520fe11a1bf0" in run
+    assert "--local-encoding 'Slash,Colon,InvalidUtf8,Dot'" in run
+    assert '"$rclone" check "$source_remote" "$droid_target"' in run
+    assert "encode_source_episode_ids(source_ids)" in run

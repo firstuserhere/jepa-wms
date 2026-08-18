@@ -7,6 +7,8 @@ import infra.skypilot.stage_droid as stage_droid
 from infra.skypilot.stage_droid import (
     FRANKA_REVISION,
     bind_franka_manifest,
+    encode_source_episode_id,
+    encode_source_episode_ids,
     list_episode_ids_local,
     write_artifacts,
 )
@@ -105,6 +107,42 @@ def test_staged_inventory_is_bound_to_exact_live_source(tmp_path: Path, monkeypa
     manifest = json.loads((output / "droid_index_manifest.json").read_text(encoding="utf-8"))
     assert manifest["verification"]["source_listing_matches_staged"] is True
     assert manifest["source_inventory"]["episode_count"] == 1
+
+
+def test_colon_episode_ids_are_encoded_and_bound_to_original_source(tmp_path: Path, monkeypatch):
+    root = tmp_path / "mounted"
+    staged_id = "lab/day/Fri_Aug_18_11：43：44_2023"
+    episode = root / "droid_raw" / "1.0.1" / staged_id
+    episode.mkdir(parents=True)
+    (episode / "trajectory.h5").write_bytes(b"trajectory")
+    output = tmp_path / "output"
+    source_id = "lab/day/Fri_Aug_18_11:43:44_2023"
+    monkeypatch.setattr(stage_droid, "list_episode_ids_gcs", lambda _uri: [source_id])
+
+    write_artifacts(
+        target_uri=None,
+        target_root=root,
+        staged_identity="sky-volume://droid-volume/droid_raw/1.0.1",
+        expected_source_root_uri="gs://gresearch/robotics",
+        mount_root="/mnt/jepawm-datasets",
+        min_episodes=1,
+        output_dir=output,
+    )
+
+    manifest = json.loads((output / "droid_index_manifest.json").read_text(encoding="utf-8"))
+    assert encode_source_episode_id(source_id) == staged_id
+    assert manifest["path_encoding"]["rclone_version"] == "v1.73.5"
+    assert manifest["source_inventory"]["canonical_episode_ids_sha256"] != manifest[
+        "canonical_episode_ids_sha256"
+    ]
+    assert manifest["source_inventory"]["staged_episode_ids_sha256"] == manifest[
+        "canonical_episode_ids_sha256"
+    ]
+
+
+def test_path_encoding_rejects_reserved_fullwidth_colon():
+    with pytest.raises(ValueError, match="reserved U\\+FF1A"):
+        encode_source_episode_ids(["lab/A：B"])
 
 
 def test_staged_inventory_rejects_missing_source_episode(tmp_path: Path, monkeypatch):
