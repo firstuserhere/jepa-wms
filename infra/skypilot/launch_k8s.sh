@@ -200,6 +200,14 @@ launch_env=()
 ((resume_requested == 0)) || launch_env+=(--env "JEPAWM_RESUME=1")
 
 # `p1` is the exact case-sensitive Enterprise priority class exposed here.
-"$sky_executable" jobs launch "$rendered_task" --priority p1 \
-  --git-url "$git_url" --git-ref "$git_ref" --workspace "$sky_workspace" \
-  "${launch_env[@]}"
+launch_command=(
+  "$sky_executable" jobs launch "$rendered_task" --priority p1
+  --git-url "$git_url" --git-ref "$git_ref" --workspace "$sky_workspace"
+)
+# macOS ships Bash 3.2, where expanding an empty array under `set -u` raises
+# "unbound variable".  Stage jobs legitimately have no launch-time env
+# overrides, so append this array only when it is non-empty.
+if ((${#launch_env[@]})); then
+  launch_command+=("${launch_env[@]}")
+fi
+"${launch_command[@]}"
