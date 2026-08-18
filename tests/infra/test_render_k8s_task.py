@@ -40,6 +40,7 @@ def test_k8s_profile_replaces_only_provider_and_storage_plumbing():
     assert rendered["num_nodes"] == 4
     assert rendered["resources"]["accelerators"] == "H200:8"
     assert rendered["resources"]["infra"] == "k8s/Skypilot"
+    assert rendered["resources"]["disk_size"] == 100
     assert rendered["resources"]["job_recovery"]["strategy"] == "FAILOVER"
     assert "cloud" not in rendered["resources"]
     assert "file_mounts" not in rendered
@@ -78,3 +79,35 @@ def test_droid_staging_uses_queue_friendly_network_bound_resources():
 
     assert task["resources"]["cpus"] == "16+"
     assert task["resources"]["memory"] == "64+"
+
+
+def test_cpu_only_profile_omits_disk_and_caps_library_threads():
+    task = _base_task()
+    task["num_nodes"] = 1
+    task["resources"].pop("accelerators")
+    task["resources"]["cpus"] = "16+"
+    task["envs"]["OMP_NUM_THREADS"] = "16"
+
+    rendered = render_k8s_task(
+        task,
+        droid_volume="jepawm-droid",
+        checkpoint_volume="jepawm-checkpoints",
+        context="Skypilot",
+    )
+
+    assert "disk_size" not in rendered["resources"]
+    assert {name: rendered["envs"][name] for name in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "RAYON_NUM_THREADS",
+        "POLARS_MAX_THREADS",
+    )} == {
+        "OMP_NUM_THREADS": "16",
+        "MKL_NUM_THREADS": "16",
+        "OPENBLAS_NUM_THREADS": "16",
+        "NUMEXPR_NUM_THREADS": "16",
+        "RAYON_NUM_THREADS": "16",
+        "POLARS_MAX_THREADS": "16",
+    }

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Render a checked SkyPilot task for the repository's Kubernetes H200 pool.
+"""Render a checked SkyPilot task for the repository's Kubernetes pools.
 
 The scientific command remains in the source task.  This renderer changes only
 provider/storage plumbing: GCP bucket mounts become named RWX PVC mounts, and
-provider-specific resource selectors become the known Kubernetes context.
+provider-specific resource selectors become the known Kubernetes context.  CPU-only
+tasks also follow the cluster's dedicated-CPU contract: no ephemeral-disk request and
+bounded library thread pools.
 """
 
 from __future__ import annotations
@@ -21,6 +23,24 @@ import yaml
 VOLUME_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9.]{0,61}[a-z0-9])?")
 DATASET_MOUNT = "/mnt/jepawm-datasets"
 CHECKPOINT_MOUNT = "/mnt/jepawm-checkpoints"
+CPU_THREAD_ENVS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "RAYON_NUM_THREADS",
+    "POLARS_MAX_THREADS",
+)
+
+
+def _cpu_thread_count(value: Any) -> str | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return str(value)
+    if isinstance(value, str):
+        match = re.fullmatch(r"\s*([1-9][0-9]*)\+?\s*", value)
+        if match:
+            return match.group(1)
+    return None
 
 
 def _validate_volume_name(value: str) -> str:
@@ -45,9 +65,14 @@ def render_k8s_task(
     resources.pop("network_tier", None)
     resources.pop("disk_tier", None)
     resources["infra"] = f"k8s/{context}"
-    # On this Sky build Kubernetes disk_size requests pod ephemeral storage.
-    # Dataset/checkpoint bytes live on PVCs, so only setup/cache headroom is needed.
-    resources["disk_size"] = 100
+    cpu_only = not resources.get("accelerators")
+    if cpu_only:
+        # This cluster's CPU pool contract forbids any disk_size request: scratch is
+        # node-local /tmp and durable bytes live on the named RWX volumes.
+        resources.pop("disk_size", None)
+    else:
+        # GPU workers still need bounded pod-ephemeral setup/cache headroom.
+        resources["disk_size"] = 100
     recovery = resources.get("job_recovery")
     if isinstance(recovery, dict):
         recovery = dict(recovery)
@@ -71,6 +96,11 @@ def render_k8s_task(
     envs = dict(rendered.get("envs", {}) or {})
     envs.pop("DROID_STORE_URI", None)
     envs.pop("CHECKPOINT_STORE_URI", None)
+    if cpu_only:
+        thread_count = _cpu_thread_count(resources.get("cpus"))
+        if thread_count is not None:
+            for variable in CPU_THREAD_ENVS:
+                envs.setdefault(variable, thread_count)
     if droid_volume:
         envs["DROID_VOLUME_NAME"] = droid_volume
     if DATASET_MOUNT in volumes:
