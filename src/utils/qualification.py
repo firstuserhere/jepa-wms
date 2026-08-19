@@ -31,10 +31,12 @@ RELEASED_DROID_FILENAME = "jepa_wm_droid.pth.tar"
 RELEASED_DROID_SHA256 = "daa69198aef764932f1cb809239a4e19c71da20a93c6a0b9f3869cb30a13f4aa"
 DINOV3_REPOSITORY_REVISION = "54694f7627fd815f62a5dcc82944ffa6153bbb76"
 # Canonical CEM-L2 result for the released/best JEPA-WM in Table 1 of
-# https://arxiv.org/abs/2512.24497. Promotion still minimizes action error;
-# this independent success-rate gate detects evaluation/data drift.
-PUBLISHED_DROID_SUCCESS_PERCENT = 48.2
-PUBLISHED_DROID_SUCCESS_STD_PERCENT = 1.8
+# https://arxiv.org/abs/2512.24497. DROID is evaluated with the paper's Action
+# Score, 800 * (0.1 - E) for terminal xyz action error E < 0.1 (and zero
+# otherwise).  ``episode_success`` is not a DROID metric: its offline dummy
+# environment intentionally returns 1.0 for every episode.
+PUBLISHED_DROID_ACTION_SCORE = 48.2
+PUBLISHED_DROID_ACTION_SCORE_STD = 1.8
 PUBLISHED_DROID_MAX_ABS_Z = 4.0
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -172,24 +174,24 @@ def _verify_planning_registry(path: str | os.PathLike[str]) -> dict[str, Any]:
         "min",
     ):
         raise QualificationError("DROID planning qualification must minimize ep_end_dist_xyz")
-    success = primary.get("metrics", {}).get("episode_success")
+    action_score = primary.get("metrics", {}).get("droid_action_score")
     if (
-        not isinstance(success, (int, float))
-        or isinstance(success, bool)
-        or not math.isfinite(float(success))
-        or not 0.0 <= float(success) <= 1.0
+        not isinstance(action_score, (int, float))
+        or isinstance(action_score, bool)
+        or not math.isfinite(float(action_score))
+        or not 0.0 <= float(action_score) <= 80.0
     ):
-        raise QualificationError("DROID planning qualification has no valid episode_success")
-    success_percent = 100.0 * float(success)
-    delta_percent = success_percent - PUBLISHED_DROID_SUCCESS_PERCENT
-    absolute_z = abs(delta_percent) / PUBLISHED_DROID_SUCCESS_STD_PERCENT
+        raise QualificationError("DROID planning qualification has no valid droid_action_score")
+    action_score = float(action_score)
+    delta = action_score - PUBLISHED_DROID_ACTION_SCORE
+    absolute_z = abs(delta) / PUBLISHED_DROID_ACTION_SCORE_STD
     published_comparison = {
         "source": "arXiv:2512.24497 Table 1",
-        "metric": "episode_success_percent",
-        "reported_mean": PUBLISHED_DROID_SUCCESS_PERCENT,
-        "reported_std": PUBLISHED_DROID_SUCCESS_STD_PERCENT,
-        "observed": success_percent,
-        "delta": delta_percent,
+        "metric": "droid_action_score",
+        "reported_mean": PUBLISHED_DROID_ACTION_SCORE,
+        "reported_std": PUBLISHED_DROID_ACTION_SCORE_STD,
+        "observed": action_score,
+        "delta": delta,
         "absolute_z": absolute_z,
         "max_absolute_z": PUBLISHED_DROID_MAX_ABS_Z,
         "within_reproduction_band": absolute_z <= PUBLISHED_DROID_MAX_ABS_Z,
@@ -197,8 +199,8 @@ def _verify_planning_registry(path: str | os.PathLike[str]) -> dict[str, Any]:
     if not published_comparison["within_reproduction_band"]:
         raise QualificationError(
             "released DROID checkpoint does not reproduce the published planning result: "
-            f"observed={success_percent:.3f}%, expected={PUBLISHED_DROID_SUCCESS_PERCENT:.3f}% "
-            f"(+/- {PUBLISHED_DROID_MAX_ABS_Z:.1f}*{PUBLISHED_DROID_SUCCESS_STD_PERCENT:.3f}%)"
+            f"observed Action Score={action_score:.3f}, expected={PUBLISHED_DROID_ACTION_SCORE:.3f} "
+            f"(+/- {PUBLISHED_DROID_MAX_ABS_Z:.1f}*{PUBLISHED_DROID_ACTION_SCORE_STD:.3f})"
         )
     return {
         "registry_path": str(registry_path),
