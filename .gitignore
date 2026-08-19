@@ -26,3 +26,8 @@ MUJOCO_LOG.TXT
 
 macros.py
 CLAUDE.md
+
+# Local model/dependency artifacts used by the SkyPilot launch bundle.
+/.artifacts/
+/dinov3/
+/.venv/

@@ -186,6 +186,13 @@ def build_plan_eval_args(
     override_datasets=True,
     wrapper_kwargs={},
     checkpoint_folder=None,
+    checkpoint_id=None,
+    checkpoint_checksum=None,
+    checkpoint_path=None,
+    checkpoint_step=None,
+    planning_result_dir=None,
+    planning_eval_id=None,
+    planning_promotion_eligible=True,
 ):
     """
     Builds evaluation arguments for online planning evaluations.
@@ -202,6 +209,15 @@ def build_plan_eval_args(
         num_act_stepped: Single value or list of num_act_stepped values.
         goal_H: Single value or list of goal_H values.
         num_elites: Single value or list of num_elites values.
+        checkpoint_id: Immutable checkpoint object identifier. Supplying any
+            checkpoint provenance argument enables strict planning provenance.
+        checkpoint_checksum: SHA-256 digest of the immutable checkpoint.
+        checkpoint_path: Absolute or relative immutable checkpoint object path.
+            This exact path replaces ``checkpoint`` in generated model configs.
+        checkpoint_step: Optional global update used to break exact metric ties.
+        planning_result_dir: Durable directory for atomic planning result JSON.
+        planning_eval_id: Optional evaluation ID (or prefix for a sweep).
+        planning_promotion_eligible: Whether results may update best_planning.
 
         If any of these parameters is a list, a cartesian product is created
         across all list parameters and eval_cfg_paths. For example, with
@@ -213,6 +229,36 @@ def build_plan_eval_args(
     """
     import copy
     import itertools
+    import os
+
+    from evals.simu_env_planning.planning.common import TASK_SET
+    from src.utils.planning_promotion import build_planning_provenance, evaluation_config_sha256
+
+    if eval_cfg_paths is None:
+        eval_cfg_paths = []
+    elif isinstance(eval_cfg_paths, (str, bytes)):
+        raise TypeError("eval_cfg_paths must be a sequence of config paths, not a string")
+    else:
+        eval_cfg_paths = list(eval_cfg_paths)
+    if any(not isinstance(path, str) or not path.strip() for path in eval_cfg_paths):
+        raise ValueError("eval_cfg_paths must contain only non-empty config paths")
+    if not eval_cfg_paths:
+        return eval_nodes, eval_tasks_per_node, [], None
+
+    provenance_values = (checkpoint_id, checkpoint_checksum, checkpoint_path, planning_result_dir, planning_eval_id)
+    strict_provenance = any(value is not None for value in provenance_values)
+    if strict_provenance:
+        missing = [
+            name
+            for name, value in (
+                ("checkpoint_id", checkpoint_id),
+                ("checkpoint_checksum", checkpoint_checksum),
+                ("checkpoint_path", checkpoint_path),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError("strict planning provenance requires " + ", ".join(missing))
 
     # Convert sweep parameters to lists for cartesian product
     alpha_values = _to_list(evals_alpha)
@@ -220,6 +266,14 @@ def build_plan_eval_args(
     num_act_stepped_values = _to_list(num_act_stepped)
     goal_H_values = _to_list(goal_H)
     num_elites_values = _to_list(num_elites)
+    num_eval_variants = (
+        len(eval_cfg_paths)
+        * len(alpha_values)
+        * len(horizon_values)
+        * len(num_act_stepped_values)
+        * len(goal_H_values)
+        * len(num_elites_values)
+    )
 
     args_eval = []
     for eval_cfg_path in eval_cfg_paths:
@@ -243,7 +297,9 @@ def build_plan_eval_args(
             planning_cfg["tasks_per_node"] = eval_tasks_per_node
             model_kwargs = planning_cfg.get("model_kwargs", {})
             model_kwargs["module_name"] = f"app.{app_name}.modelcustom.simu_env_planning.vit_enc_preds"
-            model_kwargs["checkpoint"] = checkpoint
+            # A provenance-enabled evaluation always loads an immutable object,
+            # never the asynchronously changing ``latest`` role.
+            model_kwargs["checkpoint"] = checkpoint_path if strict_provenance else checkpoint
             model_kwargs["pretrain_kwargs"].update(cfgs_model)  # Merge cfgs_model into pretrain_kwargs
             # take the needed keys from the planning cfg before overriding
             # Set to False for eval on Robocasa from DROID model
@@ -321,6 +377,30 @@ def build_plan_eval_args(
             if planning_cfg["planner"]["decode_each_iteration"]:
                 pref_tag += "_decode"
             planning_cfg["tag"] = f"{pref_tag}/{tag}"
+
+            if strict_provenance:
+                task_name = planning_cfg["task_specification"]["task"]
+                expected_tasks = TASK_SET.get(task_name, [task_name])
+                expected_episodes = int(planning_cfg["meta"]["eval_episodes"])
+                variant_eval_id = planning_eval_id
+                if variant_eval_id is not None and num_eval_variants > 1:
+                    variant_eval_id = f"{variant_eval_id}-{evaluation_config_sha256(planning_cfg)[:12]}"
+                result_dir = planning_result_dir or os.path.join(folder, "planning-results")
+                provenance = build_planning_provenance(
+                    planning_cfg,
+                    checkpoint_id=checkpoint_id,
+                    checkpoint_sha256=checkpoint_checksum,
+                    checkpoint_path=checkpoint_path,
+                    checkpoint_step=checkpoint_step,
+                    result_dir=result_dir,
+                    expected_tasks=expected_tasks,
+                    expected_episodes_per_task=expected_episodes,
+                    task_name=task_name,
+                    eval_id=variant_eval_id,
+                    promotion_eligible=planning_promotion_eligible,
+                )
+                planning_cfg["planning_provenance"] = provenance
+                planning_cfg["model_kwargs"]["checkpoint"] = provenance["checkpoint_path"]
             args_eval.append(planning_cfg)
 
     return eval_nodes, eval_tasks_per_node, args_eval, _cpus
@@ -347,7 +427,10 @@ def fetch_checkpoint(source, device="cpu"):
     else:
         logger.info(f"Loading checkpoint from local path: {source}")
         try:
-            checkpoint = torch.load(source, map_location=torch.device(device))
+            try:
+                checkpoint = torch.load(source, map_location=torch.device(device), weights_only=False)
+            except TypeError:  # PyTorch versions before weights_only was added
+                checkpoint = torch.load(source, map_location=torch.device(device))
         except Exception as e:
             logger.info(f"Encountered exception when loading checkpoint: {e}")
             raise
@@ -365,6 +448,7 @@ def load_checkpoint_state_dict(
     load_act_enc=True,
     load_prop_enc=True,
     load_opt_scale_epoch=True,
+    strict_weights=False,
 ):
     """Load state dicts from checkpoint data onto model modules.
 
@@ -407,18 +491,40 @@ def load_checkpoint_state_dict(
                 logger.info(
                     "Note: transformer.layers.x.y.bias missing keys are attention mask buffers, they are regenerated at initialization, so this is expected."
                 )
+        if strict_weights:
+            allowed_missing = {
+                key
+                for key in msg.missing_keys
+                if key.endswith(".bias") and "transformer.layers" in key
+            }
+            disallowed_missing = sorted(set(msg.missing_keys) - allowed_missing)
+            if disallowed_missing or msg.unexpected_keys:
+                raise RuntimeError(
+                    "Strict predictor checkpoint compatibility failed: "
+                    f"missing={disallowed_missing}, unexpected={sorted(msg.unexpected_keys)}"
+                )
 
     # -- loading action encoder
     if load_act_enc and action_encoder and checkpoint.get("action_encoder") is not None:
         pretrained_dict = clean_state_dict(checkpoint["action_encoder"])
         msg = action_encoder.load_state_dict(pretrained_dict, strict=False)
         logger.info(f"loaded pretrained action encoder from epoch {epoch} with msg: {msg}")
+        if strict_weights and (msg.missing_keys or msg.unexpected_keys):
+            raise RuntimeError(
+                "Strict action-encoder checkpoint compatibility failed: "
+                f"missing={sorted(msg.missing_keys)}, unexpected={sorted(msg.unexpected_keys)}"
+            )
 
     # -- loading proprio encoder
     if load_prop_enc and proprio_encoder and checkpoint.get("proprio_encoder") is not None:
         pretrained_dict = clean_state_dict(checkpoint["proprio_encoder"])
         msg = proprio_encoder.load_state_dict(pretrained_dict, strict=False)
         logger.info(f"loaded pretrained proprio encoder from epoch {epoch} with msg: {msg}")
+        if strict_weights and (msg.missing_keys or msg.unexpected_keys):
+            raise RuntimeError(
+                "Strict proprio-encoder checkpoint compatibility failed: "
+                f"missing={sorted(msg.missing_keys)}, unexpected={sorted(msg.unexpected_keys)}"
+            )
 
     # -- loading optimizer
     if load_opt_scale_epoch and opt is not None:
@@ -492,6 +598,7 @@ def load_checkpoint(
     load_stats=True,
     train_predictor=True,
     train_heads=False,
+    strict_weights=False,
 ):
     """Load checkpoint from local file path and apply to model modules.
 
@@ -536,6 +643,7 @@ def load_checkpoint(
         load_act_enc=load_act_enc,
         load_prop_enc=load_prop_enc,
         load_opt_scale_epoch=load_opt_scale_epoch,
+        strict_weights=strict_weights,
     )
 
     # Load heads from separate files if requested
@@ -568,6 +676,9 @@ def init_video_model(
     enc_version="v1",
     enc_name="vit_large",
     pretrain_enc_path=None,
+    pretrain_enc_sha256=None,
+    pretrain_enc_repo_path=None,
+    pretrain_enc_repo_revision=None,
     pretrain_enc_ckpt_key="target_encoder",
     enc_use_rope=False,
     use_sdpa_enc=True,
@@ -686,6 +797,10 @@ def init_video_model(
         encoder = DinoEncoder(
             name=enc_version,
             feature_key="x_norm_patchtokens",
+            weights_path=pretrain_enc_path,
+            expected_weights_sha256=pretrain_enc_sha256,
+            repo_path=pretrain_enc_repo_path,
+            expected_repo_revision=pretrain_enc_repo_revision,
         ).to(device)
         for p in encoder.parameters():
             p.requires_grad = False

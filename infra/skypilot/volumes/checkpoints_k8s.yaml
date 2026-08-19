@@ -1,0 +1,9 @@
+# Template only. RWX is required because all four training nodes read the
+# immutable objects while rank zero atomically publishes aliases and receipts.
+name: replace-me-jepawm-checkpoints
+type: k8s-pvc
+infra: k8s/Skypilot
+size: 2Ti
+config:
+  access_mode: ReadWriteMany
+  storage_class_name: crusoe-sharedfs

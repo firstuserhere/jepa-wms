@@ -1,0 +1,77 @@
+name: jepawm-stage-released-droid-checkpoint
+num_nodes: 1
+
+resources:
+  infra: k8s/Skypilot
+  cpus: 8+
+  memory: 32+
+  disk_size: 20
+  job_recovery:
+    strategy: FAILOVER
+    max_restarts_on_errors: 3
+
+workdir: .
+api_server_access: false
+
+secrets:
+  - secrets:HF_TOKEN
+
+volumes:
+  /mnt/jepawm-checkpoints: replace-me-jepawm-checkpoints
+
+setup: |
+  bash infra/skypilot/setup_stage.sh
+
+run: |
+  set -euo pipefail
+  export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+  : "${HF_TOKEN:?HF_TOKEN managed secret is required}"
+  : "${GIT_COMMIT_HASH:?SkyPilot must clone an exact --git-ref commit}"
+  test "$(git rev-parse HEAD)" = "$GIT_COMMIT_HASH"
+  test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+  readonly release_name=jepa_wm_droid.pth.tar
+  readonly release_revision=9b9c41ef249466630dbf1a20e78391865d07b3b9
+  readonly release_sha256=daa69198aef764932f1cb809239a4e19c71da20a93c6a0b9f3869cb30a13f4aa
+  destination_dir=/mnt/jepawm-checkpoints/artifacts/releases
+  destination="$destination_dir/jepa_wm_droid-${release_sha256}.pth.tar"
+  checksum_file="$destination.sha256"
+  revision_file="$destination.huggingface_revision.txt"
+  mkdir -p "$destination_dir"
+
+  if [[ -s "$destination" ]] && \
+     [[ "$(sha256sum "$destination" | awk '{print $1}')" == "$release_sha256" ]] && \
+     [[ -s "$checksum_file" ]] && \
+     [[ "$(awk '{print $1}' "$checksum_file")" == "$release_sha256" ]] && \
+     [[ -s "$revision_file" ]] && \
+     [[ "$(tr -d '\r\n' < "$revision_file")" == "$release_revision" ]]; then
+    echo "Verified released DROID checkpoint is already staged"
+    exit 0
+  fi
+
+  download_dir="$(mktemp -d)"
+  temporary="$(mktemp "$destination_dir/.jepa_wm_droid.${SKYPILOT_TASK_ID}.XXXXXX")"
+  trap 'rm -rf "$download_dir"; rm -f "$temporary"' EXIT
+  hf download facebook/jepa-wms "$release_name" \
+    --revision "$release_revision" \
+    --local-dir "$download_dir"
+  actual_sha256="$(sha256sum "$download_dir/$release_name" | awk '{print $1}')"
+  if [[ "$actual_sha256" != "$release_sha256" ]]; then
+    echo "Released DROID checkpoint checksum mismatch at pinned Hub revision" >&2
+    exit 2
+  fi
+
+  cp "$download_dir/$release_name" "$temporary"
+  sync "$temporary"
+  test "$(sha256sum "$temporary" | awk '{print $1}')" = "$release_sha256"
+  mv "$temporary" "$destination"
+  temporary_checksum="$checksum_file.${SKYPILOT_TASK_ID}.tmp"
+  printf '%s  %s\n' "$release_sha256" "$(basename "$destination")" > "$temporary_checksum"
+  sync "$temporary_checksum"
+  mv "$temporary_checksum" "$checksum_file"
+  temporary_revision="$revision_file.${SKYPILOT_TASK_ID}.tmp"
+  printf '%s\n' "$release_revision" > "$temporary_revision"
+  sync "$temporary_revision"
+  mv "$temporary_revision" "$revision_file"
+  trap - EXIT
+  rm -rf "$download_dir"

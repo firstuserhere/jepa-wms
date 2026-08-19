@@ -1,0 +1,38 @@
+base_config: droid_dinov3_quality_overlay.yaml
+
+overrides:
+  folder: ${JEPAWM_LOGS}/qualification/${JEPAWM_RUN_ID}/released_droid/planning
+  checkpoint_folder: ${JEPAWM_CKPT}/qualification/${JEPAWM_RUN_ID}/released_droid/planning
+  checkpointing:
+    enabled: true
+    strict_continuation: false
+    require_dataset_manifest: true
+    dataset_manifest_path: ${JEPAWM_DSET}/DROID/droid_manifest.json
+  meta:
+    plan_only_eval_mode: true
+    light_eval_only_mode: false
+    quick_debug: false
+    load_checkpoint: true
+    load_opt_scale_epoch: false
+    strict_checkpoint_weights: true
+    pretrained_path: ${RELEASED_DROID_CHECKPOINT_PATH}
+  evals:
+    # Submitit is Slurm-specific.  Inside SkyPilot, execute the exact released
+    # planner configs synchronously on this qualification node.
+    separate: false
+    # The released DROID planning templates specify one node with eight tasks.
+    # Qualification must preserve that rank-dependent sampling topology even
+    # though rollout qualification uses all 32 ranks.
+    inprocess_world_size: 8
+    low_pri: false
+    # Canonical CEM L2 is the promotion metric; the remaining released suites
+    # are qualification-only diagnostics.
+    eval_cfg_paths:
+      - configs/online_plan_evals/droid/droid_L2_cem_sourcedset_H3_nas3_maxnorm01_ctxt2_gH3.yaml
+      - configs/online_plan_evals/droid/ng/droid_L2_ng_sourcedset_H3_nas3_maxnorm01_ctxt2_gH3.yaml
+      - configs/online_plan_evals/droid/ng/droid_L1_ng_sourcedset_H3_nas3_maxnorm01_ctxt2_gH3.yaml
+      - configs/online_plan_evals/droid/droid_L1_cem_sourcedset_H3_nas3_maxnorm01_ctxt2_gH3.yaml
+      - configs/online_plan_evals/droid/gd/droid_L1_gd_sourcedset_H3_nas3_maxnorm01_ctxt2_gH3.yaml
+      - configs/online_plan_evals/droid/gd/droid_L2_gd_sourcedset_H3_nas3_maxnorm01_ctxt2_gH3.yaml
+      - configs/online_plan_evals/droid/adam/droid_L1_adam_sourcedset_H3_nas3_maxnorm01_ctxt2_gH3.yaml
+      - configs/online_plan_evals/droid/adam/droid_L2_adam_sourcedset_H3_nas3_maxnorm01_ctxt2_gH3.yaml

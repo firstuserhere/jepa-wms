@@ -1,0 +1,157 @@
+name: jepawm-droid-released-qualification
+# Match the 32-rank training topology so the fixed 64-batch-per-rank rollout
+# corpus is directly comparable to checkpoints produced by the full run.
+num_nodes: 4
+
+resources:
+  cloud: gcp
+  accelerators: H200:8
+  cpus: 128+
+  memory: 1000+
+  disk_size: 512
+  disk_tier: best
+  network_tier: best
+  use_spot: true
+  job_recovery:
+    strategy: EAGER_NEXT_REGION
+    max_restarts_on_errors: 3
+
+workdir: .
+
+envs:
+  CHECKPOINT_STORE_URI: gs://replace-me-jepawm-checkpoints
+  DROID_STORE_URI: gs://replace-me-jepawm-datasets
+  NCCL_ASYNC_ERROR_HANDLING: "1"
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+  PYTHONUNBUFFERED: "1"
+  WANDB_MODE: online
+  WANDB_PROJECT: vjepa_wm
+  DINOV3_WEIGHTS_URI: gs://replace-with-verified-original-pth
+  DINOV3_WEIGHTS_SHA256: REPLACE_WITH_FULL_SHA256
+  JEPAWM_RESUME: "0"
+
+secrets:
+  - secrets:HF_TOKEN
+  - secrets:WANDB_API_KEY
+
+file_mounts:
+  /mnt/jepawm-datasets:
+    source: ${DROID_STORE_URI}
+    mode: MOUNT_CACHED
+    type: DATASET_RO
+    persistent: true
+    config:
+      mount_cached:
+        vfs_cache_max_size: 2500G
+        vfs_cache_max_age: 24h
+  /mnt/jepawm-checkpoints:
+    source: ${CHECKPOINT_STORE_URI}
+    mode: MOUNT_CACHED
+    type: MODEL_CHECKPOINT_RW
+    persistent: true
+    config:
+      mount_cached:
+        vfs_write_back: 0s
+        vfs_cache_max_size: 200G
+
+setup: |
+  bash infra/skypilot/setup_training.sh
+
+run: |
+  set -euo pipefail
+  trap 'rc=$?; printf "qualification startup failed rc=%s line=%s command=%q\n" "$rc" "$LINENO" "$BASH_COMMAND" >&2; exit "$rc"' ERR
+  export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+  export JEPAWM_HOME="$PWD"
+  export JEPAWM_DSET=/mnt/jepawm-datasets
+  export JEPAWM_LOGS=/mnt/jepawm-checkpoints/runs
+  export JEPAWM_CKPT=/mnt/jepawm-checkpoints/checkpoints
+  export JEPAWM_OSSCKPT="$PWD/.artifacts"
+  export JEPAWM_RUN_ID="${JEPAWM_RUN_ID:-${SKYPILOT_TASK_ID:?SKYPILOT_TASK_ID is required}}"
+  if [[ ! "$JEPAWM_RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then
+    echo "JEPAWM_RUN_ID is not filesystem-safe" >&2
+    exit 2
+  fi
+  if [[ "${JEPAWM_RESUME:-0}" != 0 && "${JEPAWM_RESUME:-0}" != 1 ]]; then
+    echo "JEPAWM_RESUME must be 0 or 1" >&2
+    exit 2
+  fi
+  resume_args=()
+  [[ "${JEPAWM_RESUME:-0}" == 1 ]] && resume_args=(--resume-existing)
+  export DINOV3_REPO_PATH="$PWD/dinov3"
+  export DINOV3_WEIGHTS_PATH="$PWD/.artifacts/dinov3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+  require_file() {
+    [[ -s "$1" ]] || { echo "Required non-empty file is unavailable: $1" >&2; return 1; }
+  }
+  require_dir() {
+    [[ -d "$1" ]] || { echo "Required directory is unavailable: $1" >&2; return 1; }
+  }
+  require_file "$JEPAWM_DSET/DROID/droid_paths.csv"
+  require_file "$JEPAWM_DSET/DROID/droid_manifest.json"
+  require_dir "$JEPAWM_DSET/droid_raw/1.0.1"
+  require_dir "$JEPAWM_DSET/franka_custom"
+  echo "qualification startup: DROID and Franka volumes ready"
+
+  readonly release_name=jepa_wm_droid.pth.tar
+  readonly release_revision=9b9c41ef249466630dbf1a20e78391865d07b3b9
+  readonly release_sha256=daa69198aef764932f1cb809239a4e19c71da20a93c6a0b9f3869cb30a13f4aa
+  staged_release="/mnt/jepawm-checkpoints/artifacts/releases/jepa_wm_droid-${release_sha256}.pth.tar"
+  require_file "$staged_release"
+  test "$(sha256sum "$staged_release" | awk '{print $1}')" = "$release_sha256"
+  test "$(awk '{print $1}' "$staged_release.sha256")" = "$release_sha256"
+  test "$(tr -d '\r\n' < "$staged_release.huggingface_revision.txt")" = "$release_revision"
+
+  # Copy once per node so eight local ranks do not independently stream the
+  # 2.7 GB model from the shared filesystem during torch.load.
+  release_cache="$PWD/.artifacts/releases"
+  mkdir -p "$release_cache"
+  local_release="$release_cache/$release_name"
+  local_sha256=""
+  [[ ! -f "$local_release" ]] || local_sha256="$(sha256sum "$local_release" | awk '{print $1}')"
+  if [[ "$local_sha256" != "$release_sha256" ]]; then
+    temporary_release="$release_cache/.${release_name}.${SKYPILOT_TASK_ID}.tmp"
+    cp "$staged_release" "$temporary_release"
+    test "$(sha256sum "$temporary_release" | awk '{print $1}')" = "$release_sha256"
+    mv "$temporary_release" "$local_release"
+  fi
+  export RELEASED_DROID_CHECKPOINT_PATH="$local_release"
+  echo "qualification startup: released checkpoint verified and cached"
+
+  master_addr="$(printf '%s\n' "$SKYPILOT_NODE_IPS" | sed -n '1p')"
+  test -n "$master_addr"
+  uv run --no-sync torchrun \
+    --nnodes="$SKYPILOT_NUM_NODES" \
+    --nproc_per_node="$SKYPILOT_NUM_GPUS_PER_NODE" \
+    --node_rank="$SKYPILOT_NODE_RANK" \
+    --master_addr="$master_addr" \
+    --master_port=29600 \
+    --max_restarts=0 \
+    -m app.torchrun \
+    --fname infra/skypilot/released_rollout_overlay.yaml \
+    "${resume_args[@]}" \
+    --require-env HF_TOKEN \
+    --require-env WANDB_API_KEY
+
+  uv run --no-sync torchrun \
+    --nnodes="$SKYPILOT_NUM_NODES" \
+    --nproc_per_node="$SKYPILOT_NUM_GPUS_PER_NODE" \
+    --node_rank="$SKYPILOT_NODE_RANK" \
+    --master_addr="$master_addr" \
+    --master_port=29601 \
+    --max_restarts=0 \
+    -m app.torchrun \
+    --fname infra/skypilot/released_planning_overlay.yaml \
+    "${resume_args[@]}" \
+    --require-env HF_TOKEN \
+    --require-env WANDB_API_KEY
+
+  if [[ "$SKYPILOT_NODE_RANK" == 0 ]]; then
+    qualification_root="$JEPAWM_CKPT/qualification/$JEPAWM_RUN_ID/released_droid"
+    uv run --no-sync python infra/skypilot/qualification_receipt.py publish \
+      --rollout-result "$qualification_root/rollout/qualification_results/released_rollout.json" \
+      --planning-registry "$qualification_root/planning/planning_results/registry.json" \
+      --dataset-manifest "$JEPAWM_DSET/DROID/droid_manifest.json" \
+      --dinov3-weights "$DINOV3_WEIGHTS_PATH" \
+      --planning-wandb-run-id-file "$qualification_root/planning/run_metadata/wandb_run_id.txt" \
+      --git-commit "$GIT_COMMIT_HASH" \
+      --output "$qualification_root/QUALIFIED.json"
+  fi

@@ -25,6 +25,64 @@ def _get_port(world_size, default_port=37129):
     return get_free_port() if world_size == 1 else default_port
 
 
+def _configure_process_group_environment(
+    port=None,
+    rank_and_world_size=(None, None),
+):
+    """Resolve rank/rendezvous variables without clobbering a launcher.
+
+    ``torchrun`` owns ``MASTER_ADDR`` and ``MASTER_PORT``.  In particular, a
+    multi-node launch passes the head node address through those variables;
+    replacing either value with a per-node default partitions the job into
+    independent, hanging process groups.
+
+    Returns:
+        ``(world_size, rank, should_initialize)``.  The last element is false
+        only for the non-distributed fallback.
+    """
+
+    rank, world_size = rank_and_world_size
+    torchrun_keys = ("RANK", "WORLD_SIZE", "LOCAL_RANK")
+    torchrun_present = [key in os.environ for key in torchrun_keys]
+    if any(torchrun_present) and not all(torchrun_present):
+        missing = [key for key, present in zip(torchrun_keys, torchrun_present) if not present]
+        raise RuntimeError(f"Incomplete torchrun environment; missing: {', '.join(missing)}")
+
+    if all(torchrun_present):
+        world_size = int(os.environ["WORLD_SIZE"])
+        rank = int(os.environ["RANK"])
+    elif (rank is not None) and (world_size is not None):
+        # Compatibility with the legacy local multiprocessing launcher.
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["RANK"] = str(rank)
+        os.environ.setdefault("LOCAL_RANK", str(rank))
+    else:
+        try:
+            os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
+            os.environ["RANK"] = os.environ["SLURM_PROCID"]
+            os.environ["LOCAL_RANK"] = os.environ["SLURM_LOCALID"]
+            world_size = int(os.environ["WORLD_SIZE"])
+            rank = int(os.environ["RANK"])
+            # Submitit may already provide the correct head-node address.  A
+            # hostname fallback is retained for older single-node setups.
+            os.environ.setdefault(
+                "MASTER_ADDR",
+                os.environ.get("SLURM_LAUNCH_NODE_IPADDR", os.environ.get("HOSTNAME", socket.gethostname())),
+            )
+        except KeyError as exc:
+            logger.info(f"SLURM vars not set (distributed training not available): {exc}")
+            return 1, 0, False
+
+    world_size = int(world_size)
+    rank = int(rank)
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    if port is not None:
+        os.environ["MASTER_PORT"] = str(port)
+    else:
+        os.environ.setdefault("MASTER_PORT", str(_get_port(world_size)))
+    return world_size, rank, True
+
+
 def init_distributed(
     port=None,
     rank_and_world_size=(None, None),
@@ -41,41 +99,14 @@ def init_distributed(
     if dist.is_available() and dist.is_initialized():
         return dist.get_world_size(), dist.get_rank()
 
-    # defaults
-    rank, world_size = rank_and_world_size
-    os.environ["MASTER_ADDR"] = "localhost"
-
-    # torchrun
-    dist_keys = ["RANK", "WORLD_SIZE", "LOCAL_RANK"]
-    dist_env_set = all([key in os.environ for key in dist_keys])
-
-    # If rank and world_size are explicitly provided, set env vars for compatibility
-    # Fix local launcher on interactive node
-    if (rank is not None) and (world_size is not None) and not dist_env_set:
-        os.environ["WORLD_SIZE"] = str(world_size)
-        os.environ["RANK"] = str(rank)
-        os.environ["LOCAL_RANK"] = str(rank)
-        dist_env_set = True
-
-    # submitit / hydra.submitit
-    if not dist_env_set and ((rank is None) or (world_size is None)):
-        try:
-            os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
-            os.environ["RANK"] = os.environ["SLURM_PROCID"]
-            os.environ["LOCAL_RANK"] = os.environ["SLURM_LOCALID"]
-            # $HOSTNAME is not always exported to os.environ
-            os.environ["MASTER_ADDR"] = os.environ["HOSTNAME"] if "HOSTNAME" in os.environ else socket.gethostname()
-        except Exception as e:
-            logger.info(f"SLURM vars not set (distributed training not available): {e}")
-            world_size, rank = 1, 0
-            return world_size, rank
+    world_size, rank, should_initialize = _configure_process_group_environment(
+        port=port,
+        rank_and_world_size=rank_and_world_size,
+    )
+    if not should_initialize:
+        return world_size, rank
 
     try:
-        world_size = int(os.environ["WORLD_SIZE"])
-        rank = int(os.environ["RANK"])
-        if port is None:
-            port = _get_port(world_size)
-        os.environ["MASTER_PORT"] = str(port)
         # Increase timeout for large-scale multi-node jobs
         # Also need longer timeout for mixed video+image training where different loaders
         # (e.g., Instagram video loader) can take a very long time to fetch the first sample

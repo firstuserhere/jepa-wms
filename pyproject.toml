@@ -17,6 +17,11 @@ dependencies = [
     "torch>=2.7.0",
     "torchvision==0.22.0",
     "torchrl>=0.9.2",
+    # Runtime requirements of the pinned official DINOv3 source tree.
+    "ftfy",
+    "regex",
+    "scikit-learn",
+    "torchmetrics",
     "tensordict>=0.9.1",
     "timm>=1.0.19",
     # Data processing
@@ -25,8 +30,9 @@ dependencies = [
     "h5py",
     "einops",
     "datasets",  # HuggingFace datasets for loading parquet/arrow data
+    "pyarrow==20.0.0",  # datasets 2.14.4 requires the pre-21 PyExtensionType API
     # Image and video processing
-    "opencv-python",
+    "opencv-python-headless",
     "pillow",
     "decord>=0.6.0",
     "imageio",
@@ -63,7 +69,9 @@ dependencies = [
     "shapely",
     "pybullet",
     "mujoco>=3.2.0",
-    "dm-control>=1.0.34",
+    # Metaworld 3.1.1 pins MuJoCo 3.3.0.  Newer dm-control releases require
+    # >=3.3.6, so pin the newest compatible release for reproducible installs.
+    "dm-control==1.0.28",
     "metaworld",
     # PointMaze environment (requires both mujoco and mujoco-py)
     "d4rl",
@@ -83,8 +91,11 @@ dev = [
 ]
 
 [tool.uv.sources]
-metaworld = { git = "https://github.com/Farama-Foundation/Metaworld.git", branch = "master" }
-d4rl = { git = "git+https://github.com/Farama-Foundation/D4RL.git", branch = "master" }
+# Pin source-only simulator dependencies.  Metaworld renamed its default branch
+# from ``master`` to ``main``; using a moving/missing branch makes fresh Sky
+# workers fail before the first smoke test and is not reproducible.
+metaworld = { git = "https://github.com/Farama-Foundation/Metaworld.git", rev = "6e01ad7e2ffb2302e4dca04f796fcd8837df8540" }
+d4rl = { git = "https://github.com/Farama-Foundation/D4RL.git", rev = "89141a689b0353b0dac3da5cba60da4b1b16254d" }
 
 # NOTE: robocasa and robosuite must be installed manually from source.
 # See README.md "Optional: Robocasa" section for details.

@@ -1,0 +1,317 @@
+name: jepawm-stage-droid-raw
+num_nodes: 4
+
+resources:
+  cloud: gcp
+  # High-throughput staging uses the same four full H200 nodes as training so
+  # four disjoint source shards can drive the shared filesystem in parallel.
+  accelerators: H200:8
+  cpus: 64+
+  memory: 256+
+  disk_size: 512
+  disk_tier: best
+  network_tier: best
+  use_spot: true
+  job_recovery:
+    strategy: EAGER_NEXT_REGION
+    max_restarts_on_errors: 5
+
+workdir: .
+
+envs:
+  DROID_STORE_URI: gs://replace-me-jepawm-datasets
+  JEPAWM_STORAGE_BACKEND: gcs
+  DROID_VOLUME_NAME: ""
+  # Optional acceleration mode.  It copies and verifies only late, disjoint
+  # institution prefixes, publishes no manifest, and leaves the authoritative
+  # four-node stage to re-check every byte before publication.
+  JEPAWM_STAGE_PREFILL_ONLY: "0"
+
+secrets:
+  - secrets:HF_TOKEN
+
+file_mounts:
+  # The target must exist before submission.  After rsync completes, verify
+  # every episode through a close-to-open read-only mount before publishing
+  # the strict training manifest.
+  /mnt/jepawm-datasets:
+    source: ${DROID_STORE_URI}
+    mode: MOUNT
+    persistent: true
+    config:
+      mount:
+        read_only: true
+
+setup: |
+  bash infra/skypilot/setup_stage.sh
+
+run: |
+  set -euo pipefail
+  export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+  node_rank="${SKYPILOT_NODE_RANK:-0}"
+  if [[ "$JEPAWM_STORAGE_BACKEND" == gcs ]]; then
+    test -n "$DROID_STORE_URI"
+    droid_target="$DROID_STORE_URI/droid_raw"
+    franka_target="$DROID_STORE_URI/franka_custom"
+  elif [[ "$JEPAWM_STORAGE_BACKEND" == pvc ]]; then
+    test -n "$DROID_VOLUME_NAME"
+    test -d /mnt/jepawm-datasets
+    test -w /mnt/jepawm-datasets
+    droid_target=/mnt/jepawm-datasets/droid_raw
+    franka_target=/mnt/jepawm-datasets/franka_custom
+    # gsutil accepts a missing bucket prefix but requires local rsync targets
+    # to exist.  Create both durable destinations before transferring bytes.
+    mkdir -p "$droid_target" "$franka_target"
+  else
+    echo "JEPAWM_STORAGE_BACKEND must be gcs or pvc" >&2
+    exit 2
+  fi
+  if [[ "$JEPAWM_STORAGE_BACKEND" == gcs ]]; then
+    if [[ "$node_rank" != 0 ]]; then
+      echo "Object-store staging is rank-0-only"
+      exit 0
+    fi
+    gsutil -m rsync -d -r \
+      -x '.*SVO.*|.*stereo.*\.mp4$' \
+      gs://gresearch/robotics/droid_raw \
+      "$droid_target"
+  else
+    # The official episode IDs contain ASCII colons, which Crusoe SharedFS rejects.
+    # Pin rclone and its reversible local-backend encoding, then byte-check the
+    # complete filtered source/destination trees before any manifest is published.
+    rclone_version=v1.73.5
+    rclone_zip=rclone-v1.73.5-linux-amd64.zip
+    rclone_sha256=932cf4b7484de74d82b4875488e0009469fd21f9904673385184520fe11a1bf0
+    rclone_install="$(mktemp -d)"
+    curl -fsSLo "$rclone_install/$rclone_zip" \
+      "https://downloads.rclone.org/$rclone_version/$rclone_zip"
+    printf '%s  %s\n' "$rclone_sha256" "$rclone_install/$rclone_zip" \
+      | sha256sum --check --status
+    python3 - "$rclone_install/$rclone_zip" "$rclone_install" <<'PY'
+  import sys
+  import zipfile
+
+  with zipfile.ZipFile(sys.argv[1]) as archive:
+      archive.extract("rclone-v1.73.5-linux-amd64/rclone", sys.argv[2])
+  PY
+    rclone="$rclone_install/rclone-v1.73.5-linux-amd64/rclone"
+    chmod 0555 "$rclone"
+    test "$($rclone version | sed -n '1p')" = "rclone v1.73.5"
+    export JEPAWM_RCLONE="$rclone"
+    if [[ "$node_rank" == 0 && "$JEPAWM_STAGE_PREFILL_ONLY" != 1 ]]; then
+      python3 - <<'PY'
+  from infra.skypilot.stage_droid import encode_source_episode_ids, list_episode_ids_gcs
+
+  source_ids = list_episode_ids_gcs("gs://gresearch/robotics")
+  encoded_ids = encode_source_episode_ids(source_ids)
+  if len(source_ids) < 74000:
+      raise SystemExit(f"Official DROID source has only {len(source_ids)} episodes")
+  print(f"Preflighted collision-free DROID path encoding for {len(encoded_ids)} episodes")
+  PY
+    fi
+    if [[ "$JEPAWM_STAGE_PREFILL_ONLY" == 1 ]]; then
+      # These are the final prefixes of the four authoritative shards.  Starting
+      # them only after the main job is already copying its first prefix avoids
+      # concurrent writers while removing the sequential long tail.
+      case "$node_rank" in
+        0) labs=(RAD) ;;
+        1) labs=(RPL) ;;
+        2) labs=(CLVR GuptaLab) ;;
+        3) labs=(RAIL) ;;
+        *) echo "Unexpected prefill node rank: $node_rank" >&2; exit 2 ;;
+      esac
+    else
+      case "$node_rank" in
+        0) labs=(TRI PennPAL RAD) ;;
+        1) labs=(AUTOLab WEIRD RPL) ;;
+        2) labs=(IPRL ILIAD CLVR GuptaLab) ;;
+        3) labs=(IRIS REAL RAIL) ;;
+        *) echo "Unexpected staging node rank: $node_rank" >&2; exit 2 ;;
+      esac
+    fi
+    source_remote=':gcs,anonymous=true:gresearch/robotics/droid_raw/1.0.1'
+    rclone_common=(
+      --exclude '**SVO**'
+      --exclude '**stereo**.mp4'
+      --local-encoding 'Slash,Colon,InvalidUtf8,Dot'
+      --fast-list
+      --checkers 64
+      --stats 1m
+      --stats-one-line
+    )
+    for lab in "${labs[@]}"; do
+      mkdir -p "$droid_target/1.0.1/$lab"
+      python3 infra/skypilot/stage_droid.py \
+        --cleanup-rclone-partials "$droid_target/1.0.1/$lab"
+      "$rclone" copy "$source_remote/$lab" "$droid_target/1.0.1/$lab" \
+        "${rclone_common[@]}" --checksum --transfers 32
+      "$rclone" check "$source_remote/$lab" "$droid_target/1.0.1/$lab" \
+        "${rclone_common[@]}"
+    done
+
+    if [[ "$JEPAWM_STAGE_PREFILL_ONLY" == 1 ]]; then
+      echo "DROID late-shard prefill completed and checksum-verified: ${labs[*]}"
+      exit 0
+    fi
+
+    receipt_dir="/mnt/jepawm-datasets/.staging/$SKYPILOT_TASK_ID"
+    mkdir -p "$receipt_dir"
+    python3 - "$receipt_dir/rank-$node_rank.json" "$node_rank" \
+      "${labs[*]}" "$(git rev-parse HEAD)" <<'PY'
+  import json
+  import os
+  import sys
+  import tempfile
+  from datetime import datetime, timezone
+  from pathlib import Path
+
+  output = Path(sys.argv[1])
+  document = {
+      "schema_version": 1,
+      "rank": int(sys.argv[2]),
+      "labs": sys.argv[3].split(),
+      "git_commit": sys.argv[4],
+      "source": "gs://gresearch/robotics/droid_raw/1.0.1",
+      "rclone_version": "v1.73.5",
+      "rclone_sha256": "932cf4b7484de74d82b4875488e0009469fd21f9904673385184520fe11a1bf0",
+      "local_encoding": "Slash,Colon,InvalidUtf8,Dot",
+      "copy_and_checksum_check_complete": True,
+      "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+  }
+  descriptor, temporary = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent)
+  with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+      json.dump(document, stream, sort_keys=True)
+      stream.write("\n")
+      stream.flush()
+      os.fsync(stream.fileno())
+  os.replace(temporary, output)
+  PY
+    if [[ "$node_rank" != 0 ]]; then
+      echo "DROID staging shard rank $node_rank completed: ${labs[*]}"
+      exit 0
+    fi
+
+    # Rank 0 publishes nothing until every disjoint shard has completed its own
+    # source-to-SharedFS checksum comparison at this exact Git commit.
+    for _ in $(seq 1 17280); do
+      receipt_count="$(find "$receipt_dir" -maxdepth 1 -type f -name 'rank-*.json' | wc -l | tr -d ' ')"
+      [[ "$receipt_count" == 4 ]] && break
+      sleep 10
+    done
+    python3 - "$receipt_dir" "$(git rev-parse HEAD)" <<'PY'
+  import json
+  import sys
+  from pathlib import Path
+
+  root = Path(sys.argv[1])
+  expected_commit = sys.argv[2]
+  expected = {
+      0: ["TRI", "PennPAL", "RAD"],
+      1: ["AUTOLab", "WEIRD", "RPL"],
+      2: ["IPRL", "ILIAD", "CLVR", "GuptaLab"],
+      3: ["IRIS", "REAL", "RAIL"],
+  }
+  receipts = {}
+  for path in root.glob("rank-*.json"):
+      with path.open("r", encoding="utf-8") as stream:
+          document = json.load(stream)
+      receipts[document.get("rank")] = document
+  if set(receipts) != set(expected):
+      raise SystemExit(f"Missing DROID staging shard receipts: {set(expected) - set(receipts)}")
+  for rank, labs in expected.items():
+      document = receipts[rank]
+      if (
+          document.get("labs") != labs
+          or document.get("git_commit") != expected_commit
+          or document.get("rclone_version") != "v1.73.5"
+          or document.get("copy_and_checksum_check_complete") is not True
+      ):
+          raise SystemExit(f"Invalid DROID staging receipt for rank {rank}: {document}")
+  print("Verified all four disjoint DROID transfer receipts")
+  PY
+  fi
+
+  franka_cache="$(mktemp -d)"
+  trap 'rm -rf "$franka_cache"' EXIT
+  hf download facebook/jepa-wms \
+    --type dataset \
+    --revision 6116f042ae7ae4c8e3f1fd2f194f432615664182 \
+    --include 'franka_custom/*' \
+    --local-dir "$franka_cache"
+  gsutil -m rsync -d -r "$franka_cache/franka_custom" "$franka_target"
+
+  verification_dir="$(mktemp -d)"
+  trap 'rm -rf "$franka_cache" "$verification_dir"' EXIT
+  if [[ "$JEPAWM_STORAGE_BACKEND" == gcs ]]; then
+    python3 infra/skypilot/stage_droid.py \
+      --target-uri "$DROID_STORE_URI" \
+      --expected-source-root-uri gs://gresearch/robotics \
+      --mount-root /mnt/jepawm-datasets \
+      --min-episodes 74000 \
+      --output-dir "$verification_dir"
+  else
+    python3 infra/skypilot/stage_droid.py \
+      --target-root /mnt/jepawm-datasets \
+      --staged-identity "sky-volume://$DROID_VOLUME_NAME/droid_raw/1.0.1" \
+      --expected-source-root-uri gs://gresearch/robotics \
+      --mount-root /mnt/jepawm-datasets \
+      --min-episodes 74000 \
+      --output-dir "$verification_dir"
+    unset JEPAWM_RCLONE
+    rm -rf "$rclone_install"
+  fi
+
+  python3 src/scripts/build_droid_manifest.py \
+    --paths "$verification_dir/droid_paths.csv" \
+    --droid-root /mnt/jepawm-datasets/droid_raw/1.0.1 \
+    --output "$verification_dir/droid_manifest.json" \
+    --source-uri gs://gresearch/robotics/droid_raw/1.0.1 \
+    --source-index-manifest "$verification_dir/droid_index_manifest.json" \
+    --dataset-version 1.0.1 \
+    --camera-key left_mp4_path \
+    --filter-loader-unusable \
+    --filtered-paths-output "$verification_dir/droid_paths.loader-ready.csv" \
+    --published-path-list-path /mnt/jepawm-datasets/DROID/droid_paths.csv
+
+  # Bind the exact held-out Franka_hf bytes used by rollout/planning promotion
+  # into the same fingerprint.  Compare the staged read-only tree byte-for-byte
+  # with the pinned Hub checkout before publishing anything.
+  python3 infra/skypilot/stage_droid.py \
+    --bind-franka-manifest "$verification_dir/droid_manifest.json" \
+    --franka-source-root "$franka_cache/franka_custom" \
+    --franka-staged-root /mnt/jepawm-datasets/franka_custom
+
+  python3 - "$verification_dir/droid_manifest.json" <<'PY'
+  import json
+  import sys
+
+  with open(sys.argv[1], "r", encoding="utf-8") as stream:
+      manifest = json.load(stream)
+  verification = manifest.get("verification", {})
+  auxiliary = manifest.get("auxiliary_datasets", {}).get("Franka_hf", {})
+  if (
+      verification.get("files_checked") is not True
+      or verification.get("complete") is not True
+      or verification.get("source_listing_matches_staged") is not True
+      or verification.get("auxiliary_files_checked") is not True
+      or auxiliary.get("hub_revision") != "6116f042ae7ae4c8e3f1fd2f194f432615664182"
+      or auxiliary.get("verification", {}).get("source_tree_matches_staged") is not True
+  ):
+      raise SystemExit("Combined DROID + Franka_hf full-file verification did not pass")
+  PY
+
+  cp "$verification_dir/droid_paths.loader-ready.csv" "$verification_dir/droid_paths.csv"
+  if [[ "$JEPAWM_STORAGE_BACKEND" == gcs ]]; then
+    gsutil -m cp \
+      "$verification_dir/droid_paths.csv" \
+      "$verification_dir/droid_manifest.json" \
+      "$DROID_STORE_URI/DROID/"
+  else
+    mkdir -p /mnt/jepawm-datasets/DROID
+    for artifact in droid_paths.csv droid_manifest.json; do
+      temporary="/mnt/jepawm-datasets/DROID/.${artifact}.${SKYPILOT_TASK_ID}.tmp"
+      cp "$verification_dir/$artifact" "$temporary"
+      sync "$temporary"
+      mv "$temporary" "/mnt/jepawm-datasets/DROID/$artifact"
+    done
+  fi

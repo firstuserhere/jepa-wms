@@ -1,0 +1,32 @@
+base_config: droid_dinov3_quality_overlay.yaml
+
+overrides:
+  folder: ${JEPAWM_LOGS}/${JEPAWM_RUN_ID}
+  checkpoint_folder: ${JEPAWM_CKPT}/${JEPAWM_RUN_ID}
+  checkpointing:
+    # The infrastructure smoke is intentionally tiny; promotion belongs to
+    # the fixed full-quality corpus, not this 1% debugging subset.
+    rollout_promotion:
+      enabled: false
+  data:
+    loader:
+      batch_size: 2
+      num_workers: 4
+      persistent_workers: false
+    custom:
+      dset_fraction: 0.01
+  meta:
+    quick_debug: true
+    eval_freq: 1000000
+    light_eval_freq: 1000000
+    save_every_freq: 1
+  optimization:
+    transition_model:
+      iterations_per_epoch: 8
+      # Two fixed epochs across both managed-job attempts.  The operational
+      # checkpoint probe stops after epoch 1 without changing this contract.
+      num_epochs: 2
+      warmup: 0
+  evals:
+    separate: false
+    eval_cfg_paths: []

@@ -1,0 +1,9 @@
+# Template only. Creating an 8 TiB volume is a material external action; use
+# --name to choose a user-owned collision-free name after reviewing capacity.
+name: replace-me-jepawm-droid-raw
+type: k8s-pvc
+infra: k8s/Skypilot
+size: 8Ti
+config:
+  access_mode: ReadWriteMany
+  storage_class_name: crusoe-sharedfs

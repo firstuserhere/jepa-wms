@@ -171,6 +171,8 @@ class Logger:
         return d
 
     def log(self, d, multitask=False):
+        """Log metrics and return the exact averaged dictionary that was logged."""
+
         d = self.average_task_metrics(d)
         if self._save_csv:
             general_possible_keys = [
@@ -206,3 +208,4 @@ class Logger:
                         task_file_path, mode="a", header=task_specific_keys if not file_exists else False, index=None
                     )
         self._print(d)
+        return d
