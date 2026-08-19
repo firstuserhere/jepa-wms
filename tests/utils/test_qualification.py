@@ -96,7 +96,7 @@ def _qualification_inputs(tmp_path: Path, monkeypatch):
     mark_planning_evaluations_launched(registry, planning_reference.object_id)
     result = build_complete_planning_result(
         provenance,
-        metrics={"ep_end_dist_xyz": 0.04, "episode_success": 0.0},
+        metrics={"ep_end_dist_xyz": 0.04, "episode_success": 0.482},
         observed_episode_counts={"droid-base": 64},
     )
     write_complete_planning_result(result)
@@ -134,6 +134,9 @@ def test_released_qualification_receipt_binds_all_training_inputs(tmp_path: Path
         "mode": "min",
         "value": 0.04,
     }
+    comparison = verified["planning"]["published_comparison"]
+    assert comparison["observed"] == pytest.approx(48.2)
+    assert comparison["within_reproduction_band"] is True
 
 
 def test_released_qualification_receipt_rejects_changed_inputs(tmp_path: Path, monkeypatch):
@@ -156,3 +159,11 @@ def test_released_qualification_receipt_rejects_changed_inputs(tmp_path: Path, m
             dinov3_weights_path=tmp_path / "dinov3.pth",
             source_git_commit="b" * 40,
         )
+
+
+def test_released_qualification_rejects_published_baseline_drift(tmp_path: Path, monkeypatch):
+    inputs = _qualification_inputs(tmp_path, monkeypatch)
+    monkeypatch.setattr(qualification, "PUBLISHED_DROID_SUCCESS_PERCENT", 80.0)
+
+    with pytest.raises(QualificationError, match="does not reproduce the published"):
+        publish_released_droid_qualification(**inputs)
