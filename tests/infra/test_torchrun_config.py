@@ -191,7 +191,7 @@ def test_qualification_task_publishes_receipt_after_planning():
     assert run.rindex("qualification_receipt.py publish") > run.index("--master_port=29601")
     assert "--planning-wandb-run-id-file" in run
     assert "hf download facebook/jepa-wms" not in run
-    assert "$JEPAWM_CKPT/artifacts/releases/jepa_wm_droid-${release_sha256}.pth.tar" in run
+    assert "/mnt/jepawm-checkpoints/artifacts/releases/jepa_wm_droid-${release_sha256}.pth.tar" in run
 
 
 def test_released_checkpoint_stage_is_pinned_and_atomic():

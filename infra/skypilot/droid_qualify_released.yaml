@@ -94,7 +94,7 @@ run: |
   readonly release_name=jepa_wm_droid.pth.tar
   readonly release_revision=9b9c41ef249466630dbf1a20e78391865d07b3b9
   readonly release_sha256=daa69198aef764932f1cb809239a4e19c71da20a93c6a0b9f3869cb30a13f4aa
-  staged_release="$JEPAWM_CKPT/artifacts/releases/jepa_wm_droid-${release_sha256}.pth.tar"
+  staged_release="/mnt/jepawm-checkpoints/artifacts/releases/jepa_wm_droid-${release_sha256}.pth.tar"
   require_file "$staged_release"
   test "$(sha256sum "$staged_release" | awk '{print $1}')" = "$release_sha256"
   test "$(awk '{print $1}' "$staged_release.sha256")" = "$release_sha256"

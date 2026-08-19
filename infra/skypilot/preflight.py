@@ -134,7 +134,7 @@ def validate_tasks() -> None:
         raise AssertionError("Released DROID checkpoint SHA-256 is not pinned")
     if "hf download facebook/jepa-wms" in qualify_run:
         raise AssertionError("Qualification must consume the pre-staged immutable released checkpoint")
-    if "$JEPAWM_CKPT/artifacts/releases/jepa_wm_droid-${release_sha256}.pth.tar" not in qualify_run:
+    if "/mnt/jepawm-checkpoints/artifacts/releases/jepa_wm_droid-${release_sha256}.pth.tar" not in qualify_run:
         raise AssertionError("Qualification does not consume the shared released-checkpoint artifact")
 
 
