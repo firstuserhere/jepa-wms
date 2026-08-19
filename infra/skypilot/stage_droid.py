@@ -72,17 +72,39 @@ def validate_gs_uri(value: str) -> str:
     return value
 
 
+def _anonymous_rclone_droid_remote(target_uri: str) -> str:
+    target_uri = validate_gs_uri(target_uri)
+    if target_uri != "gs://gresearch/robotics":
+        raise ValueError("Anonymous rclone listing is restricted to the official DROID source")
+    return ":gcs,anonymous=true:gresearch/robotics/droid_raw/1.0.1"
+
+
 def list_episode_ids_gcs(target_uri: str) -> list[str]:
     root_uri = f"{target_uri}/droid_raw/1.0.1"
+    rclone = os.environ.get("JEPAWM_RCLONE")
+    if rclone and target_uri.rstrip("/") == "gs://gresearch/robotics":
+        listing_command = [
+            rclone,
+            "lsf",
+            _anonymous_rclone_droid_remote(target_uri),
+            "--recursive",
+            "--files-only",
+            "--include",
+            "**/trajectory.h5",
+            "--fast-list",
+        ]
+        prefix = ""
+    else:
+        listing_command = ["gsutil", "ls", "-r", f"{root_uri}/**/trajectory.h5"]
+        prefix = root_uri + "/"
     listing = subprocess.Popen(
-        ["gsutil", "ls", "-r", f"{root_uri}/**/trajectory.h5"],
+        listing_command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
     assert listing.stdout is not None
     episode_ids = []
-    prefix = root_uri + "/"
     for raw_line in listing.stdout:
         object_uri = raw_line.strip()
         if not object_uri.endswith("/trajectory.h5") or not object_uri.startswith(prefix):
@@ -94,7 +116,9 @@ def list_episode_ids_gcs(target_uri: str) -> list[str]:
     stderr = "" if listing.stderr is None else listing.stderr.read()
     return_code = listing.wait()
     if return_code:
-        raise RuntimeError(f"gsutil listing failed with exit code {return_code}: {stderr[-2000:]}")
+        raise RuntimeError(
+            f"DROID source listing failed with exit code {return_code}: {stderr[-2000:]}"
+        )
     return sorted(set(episode_ids))
 
 

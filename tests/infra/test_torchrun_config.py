@@ -251,3 +251,4 @@ def test_pvc_staging_creates_and_checks_local_rsync_targets():
     assert "--local-encoding 'Slash,Colon,InvalidUtf8,Dot'" in run
     assert '"$rclone" check "$source_remote" "$droid_target"' in run
     assert "encode_source_episode_ids(source_ids)" in run
+    assert 'export JEPAWM_RCLONE="$rclone"' in run

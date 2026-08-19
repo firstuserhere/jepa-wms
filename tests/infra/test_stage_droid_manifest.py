@@ -6,12 +6,21 @@ import pytest
 import infra.skypilot.stage_droid as stage_droid
 from infra.skypilot.stage_droid import (
     FRANKA_REVISION,
+    _anonymous_rclone_droid_remote,
     bind_franka_manifest,
     encode_source_episode_id,
     encode_source_episode_ids,
     list_episode_ids_local,
     write_artifacts,
 )
+
+
+def test_anonymous_rclone_remote_is_restricted_to_official_droid():
+    assert _anonymous_rclone_droid_remote("gs://gresearch/robotics") == (
+        ":gcs,anonymous=true:gresearch/robotics/droid_raw/1.0.1"
+    )
+    with pytest.raises(ValueError, match="restricted to the official DROID source"):
+        _anonymous_rclone_droid_remote("gs://private-bucket/datasets")
 
 
 def _write_verified_manifest(path: Path) -> None:

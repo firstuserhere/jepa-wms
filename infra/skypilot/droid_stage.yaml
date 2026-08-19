@@ -68,20 +68,10 @@ run: |
     # The official episode IDs contain ASCII colons, which Crusoe SharedFS rejects.
     # Pin rclone and its reversible local-backend encoding, then byte-check the
     # complete filtered source/destination trees before any manifest is published.
-    python3 - <<'PY'
-  from infra.skypilot.stage_droid import encode_source_episode_ids, list_episode_ids_gcs
-
-  source_ids = list_episode_ids_gcs("gs://gresearch/robotics")
-  encoded_ids = encode_source_episode_ids(source_ids)
-  if len(source_ids) < 74000:
-      raise SystemExit(f"Official DROID source has only {len(source_ids)} episodes")
-  print(f"Preflighted collision-free DROID path encoding for {len(encoded_ids)} episodes")
-  PY
     rclone_version=v1.73.5
     rclone_zip=rclone-v1.73.5-linux-amd64.zip
     rclone_sha256=932cf4b7484de74d82b4875488e0009469fd21f9904673385184520fe11a1bf0
     rclone_install="$(mktemp -d)"
-    trap 'rm -rf "$rclone_install"' EXIT
     curl -fsSLo "$rclone_install/$rclone_zip" \
       "https://downloads.rclone.org/$rclone_version/$rclone_zip"
     printf '%s  %s\n' "$rclone_sha256" "$rclone_install/$rclone_zip" \
@@ -96,6 +86,16 @@ run: |
     rclone="$rclone_install/rclone-v1.73.5-linux-amd64/rclone"
     chmod 0555 "$rclone"
     test "$($rclone version | sed -n '1p')" = "rclone v1.73.5"
+    export JEPAWM_RCLONE="$rclone"
+    python3 - <<'PY'
+  from infra.skypilot.stage_droid import encode_source_episode_ids, list_episode_ids_gcs
+
+  source_ids = list_episode_ids_gcs("gs://gresearch/robotics")
+  encoded_ids = encode_source_episode_ids(source_ids)
+  if len(source_ids) < 74000:
+      raise SystemExit(f"Official DROID source has only {len(source_ids)} episodes")
+  print(f"Preflighted collision-free DROID path encoding for {len(encoded_ids)} episodes")
+  PY
     source_remote=':gcs,anonymous=true:gresearch/robotics/droid_raw'
     rclone_common=(
       --exclude '**SVO**'
@@ -109,8 +109,6 @@ run: |
     "$rclone" copy "$source_remote" "$droid_target" \
       "${rclone_common[@]}" --checksum --transfers 16
     "$rclone" check "$source_remote" "$droid_target" "${rclone_common[@]}"
-    rm -rf "$rclone_install"
-    trap - EXIT
   fi
 
   franka_cache="$(mktemp -d)"
@@ -139,6 +137,8 @@ run: |
       --mount-root /mnt/jepawm-datasets \
       --min-episodes 74000 \
       --output-dir "$verification_dir"
+    unset JEPAWM_RCLONE
+    rm -rf "$rclone_install"
   fi
 
   python3 src/scripts/build_droid_manifest.py \
