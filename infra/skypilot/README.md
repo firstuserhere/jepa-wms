@@ -5,6 +5,15 @@ only operational requirements on top: strict continuation, required W&B,
 pinned DINOv3 artifacts, durable checkpoint roles, and a canonical planning
 promotion suite.
 
+> **Current-state notice (2026-08-19):** Read
+> [`../../docs/RESEARCH_STATUS.md`](../../docs/RESEARCH_STATUS.md) and
+> [`../../docs/OPERATIONS.md`](../../docs/OPERATIONS.md) before using this
+> command reference. The two named JEPA-WM volumes already exist and DROID is
+> staged; do not recreate them. The current Kubernetes renderer also predates
+> Pantheon's latest no-`infra`/no-`disk_size` task contract and must be updated
+> and revalidated before another launch. Released qualification is incomplete,
+> and neither the real training smoke nor full training has run.
+
 The intended order is:
 
 1. Preflight locally (zero cloud mutation).
@@ -27,9 +36,11 @@ node and 128 H200s total. Availability is dynamic (the read-only check on
 queues/bids for capacity. Do not use the GCP profile below unless `sky check`
 later confirms GCP in the selected workspace.
 
-Kubernetes managed recovery needs durable RWX PVCs. Templates are provided,
-but applying them is intentionally manual because creating 10 TiB of storage
-is a material external action:
+Kubernetes managed recovery needs durable RWX PVCs. In the current default
+workspace, use the existing `firstuserhere-jepawm-droid` and
+`firstuserhere-jepawm-checkpoints` volumes. Templates are retained for a new
+environment, but applying them requires explicit authorization because creating
+10 TiB of storage is a material external action:
 
 ```bash
 SKY_WORKSPACE=YOUR_KUBERNETES_WORKSPACE

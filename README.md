@@ -37,6 +37,19 @@
 
 ---
 
+## Research fork onboarding
+
+This branch contains Pantheon/SkyPilot infrastructure for a faithful DINOv3 +
+DROID reproduction, durable schema-v2 checkpoints, released-model
+qualification, and continued-pretraining lineage. New agents should begin with
+[`AGENTS.md`](AGENTS.md) and the maintained [`docs/`](docs/README.md) index.
+
+The latest proven runtime state and open launch gates are recorded in
+[`docs/RESEARCH_STATUS.md`](docs/RESEARCH_STATUS.md). Do not infer that a full
+training run has occurred from the presence of launch templates.
+
+---
+
 ## 🎯 Pretrained Models
 
 We provide pretrained [JEPA-WMs](https://arxiv.org/abs/2512.24497), as well as [DINO-WM](https://arxiv.org/abs/2411.04983) and [V-JEPA-2-AC(fixed)](https://arxiv.org/abs/2506.09985) baseline models for various environments.
