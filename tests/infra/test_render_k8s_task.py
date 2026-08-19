@@ -72,13 +72,16 @@ def test_k8s_profile_rejects_missing_or_unsafe_volume_names():
         raise AssertionError("unsafe DROID volume was accepted")
 
 
-def test_droid_staging_uses_queue_friendly_network_bound_resources():
+def test_droid_staging_uses_four_full_h200_nodes_for_parallel_transfer():
     task = yaml.safe_load(
         (REPO_ROOT / "infra/skypilot/droid_stage.yaml").read_text(encoding="utf-8")
     )
 
-    assert task["resources"]["cpus"] == "16+"
-    assert task["resources"]["memory"] == "64+"
+    assert task["num_nodes"] == 4
+    assert task["resources"]["accelerators"] == "H200:8"
+    assert task["resources"]["cpus"] == "64+"
+    assert task["resources"]["network_tier"] == "best"
+    assert task["resources"]["memory"] == "256+"
 
 
 def test_cpu_only_profile_omits_disk_and_caps_library_threads():

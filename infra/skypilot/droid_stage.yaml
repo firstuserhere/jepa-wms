@@ -1,14 +1,16 @@
 name: jepawm-stage-droid-raw
-num_nodes: 1
+num_nodes: 4
 
 resources:
   cloud: gcp
-  # Staging is network/shared-filesystem bound.  Keep the pod small enough to
-  # fit while the H200 pool is busy; gsutil still parallelizes across 16 CPUs.
-  cpus: 16+
-  memory: 64+
+  # High-throughput staging uses the same four full H200 nodes as training so
+  # four disjoint source shards can drive the shared filesystem in parallel.
+  accelerators: H200:8
+  cpus: 64+
+  memory: 256+
   disk_size: 512
   disk_tier: best
+  network_tier: best
   use_spot: true
   job_recovery:
     strategy: EAGER_NEXT_REGION
@@ -42,6 +44,7 @@ setup: |
 run: |
   set -euo pipefail
   export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+  node_rank="${SKYPILOT_NODE_RANK:-0}"
   if [[ "$JEPAWM_STORAGE_BACKEND" == gcs ]]; then
     test -n "$DROID_STORE_URI"
     droid_target="$DROID_STORE_URI/droid_raw"
@@ -60,6 +63,10 @@ run: |
     exit 2
   fi
   if [[ "$JEPAWM_STORAGE_BACKEND" == gcs ]]; then
+    if [[ "$node_rank" != 0 ]]; then
+      echo "Object-store staging is rank-0-only"
+      exit 0
+    fi
     gsutil -m rsync -d -r \
       -x '.*SVO.*|.*stereo.*\.mp4$' \
       gs://gresearch/robotics/droid_raw \
@@ -87,7 +94,8 @@ run: |
     chmod 0555 "$rclone"
     test "$($rclone version | sed -n '1p')" = "rclone v1.73.5"
     export JEPAWM_RCLONE="$rclone"
-    python3 - <<'PY'
+    if [[ "$node_rank" == 0 ]]; then
+      python3 - <<'PY'
   from infra.skypilot.stage_droid import encode_source_episode_ids, list_episode_ids_gcs
 
   source_ids = list_episode_ids_gcs("gs://gresearch/robotics")
@@ -96,19 +104,107 @@ run: |
       raise SystemExit(f"Official DROID source has only {len(source_ids)} episodes")
   print(f"Preflighted collision-free DROID path encoding for {len(encoded_ids)} episodes")
   PY
-    source_remote=':gcs,anonymous=true:gresearch/robotics/droid_raw'
+    fi
+    case "$node_rank" in
+      0) labs=(TRI PennPAL RAD) ;;
+      1) labs=(AUTOLab WEIRD RPL) ;;
+      2) labs=(IPRL ILIAD CLVR GuptaLab) ;;
+      3) labs=(IRIS REAL RAIL) ;;
+      *) echo "Unexpected staging node rank: $node_rank" >&2; exit 2 ;;
+    esac
+    source_remote=':gcs,anonymous=true:gresearch/robotics/droid_raw/1.0.1'
     rclone_common=(
       --exclude '**SVO**'
       --exclude '**stereo**.mp4'
       --local-encoding 'Slash,Colon,InvalidUtf8,Dot'
       --fast-list
-      --checkers 32
+      --checkers 64
       --stats 1m
       --stats-one-line
     )
-    "$rclone" copy "$source_remote" "$droid_target" \
-      "${rclone_common[@]}" --checksum --transfers 16
-    "$rclone" check "$source_remote" "$droid_target" "${rclone_common[@]}"
+    for lab in "${labs[@]}"; do
+      mkdir -p "$droid_target/1.0.1/$lab"
+      "$rclone" copy "$source_remote/$lab" "$droid_target/1.0.1/$lab" \
+        "${rclone_common[@]}" --checksum --transfers 32
+      "$rclone" check "$source_remote/$lab" "$droid_target/1.0.1/$lab" \
+        "${rclone_common[@]}"
+    done
+
+    receipt_dir="/mnt/jepawm-datasets/.staging/$SKYPILOT_TASK_ID"
+    mkdir -p "$receipt_dir"
+    python3 - "$receipt_dir/rank-$node_rank.json" "$node_rank" \
+      "${labs[*]}" "$(git rev-parse HEAD)" <<'PY'
+  import json
+  import os
+  import sys
+  import tempfile
+  from datetime import datetime, timezone
+  from pathlib import Path
+
+  output = Path(sys.argv[1])
+  document = {
+      "schema_version": 1,
+      "rank": int(sys.argv[2]),
+      "labs": sys.argv[3].split(),
+      "git_commit": sys.argv[4],
+      "source": "gs://gresearch/robotics/droid_raw/1.0.1",
+      "rclone_version": "v1.73.5",
+      "rclone_sha256": "932cf4b7484de74d82b4875488e0009469fd21f9904673385184520fe11a1bf0",
+      "local_encoding": "Slash,Colon,InvalidUtf8,Dot",
+      "copy_and_checksum_check_complete": True,
+      "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+  }
+  descriptor, temporary = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent)
+  with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+      json.dump(document, stream, sort_keys=True)
+      stream.write("\n")
+      stream.flush()
+      os.fsync(stream.fileno())
+  os.replace(temporary, output)
+  PY
+    if [[ "$node_rank" != 0 ]]; then
+      echo "DROID staging shard rank $node_rank completed: ${labs[*]}"
+      exit 0
+    fi
+
+    # Rank 0 publishes nothing until every disjoint shard has completed its own
+    # source-to-SharedFS checksum comparison at this exact Git commit.
+    for _ in $(seq 1 17280); do
+      receipt_count="$(find "$receipt_dir" -maxdepth 1 -type f -name 'rank-*.json' | wc -l | tr -d ' ')"
+      [[ "$receipt_count" == 4 ]] && break
+      sleep 10
+    done
+    python3 - "$receipt_dir" "$(git rev-parse HEAD)" <<'PY'
+  import json
+  import sys
+  from pathlib import Path
+
+  root = Path(sys.argv[1])
+  expected_commit = sys.argv[2]
+  expected = {
+      0: ["TRI", "PennPAL", "RAD"],
+      1: ["AUTOLab", "WEIRD", "RPL"],
+      2: ["IPRL", "ILIAD", "CLVR", "GuptaLab"],
+      3: ["IRIS", "REAL", "RAIL"],
+  }
+  receipts = {}
+  for path in root.glob("rank-*.json"):
+      with path.open("r", encoding="utf-8") as stream:
+          document = json.load(stream)
+      receipts[document.get("rank")] = document
+  if set(receipts) != set(expected):
+      raise SystemExit(f"Missing DROID staging shard receipts: {set(expected) - set(receipts)}")
+  for rank, labs in expected.items():
+      document = receipts[rank]
+      if (
+          document.get("labs") != labs
+          or document.get("git_commit") != expected_commit
+          or document.get("rclone_version") != "v1.73.5"
+          or document.get("copy_and_checksum_check_complete") is not True
+      ):
+          raise SystemExit(f"Invalid DROID staging receipt for rank {rank}: {document}")
+  print("Verified all four disjoint DROID transfer receipts")
+  PY
   fi
 
   franka_cache="$(mktemp -d)"

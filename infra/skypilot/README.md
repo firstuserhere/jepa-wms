@@ -96,8 +96,10 @@ infra/skypilot/launch_k8s.sh full \
   --git-url "$GIT_URL" --git-ref "$GIT_REF" --workspace "$SKY_WORKSPACE"
 ```
 
-`stage` exactly mirrors the public filtered raw DROID release directly from GCS into
-the 8 TiB PVC and publishes its fully verified manifest only after checking
+`stage` uses four full H200 nodes to mirror disjoint, size-balanced institution
+shards of the public filtered raw DROID release into the 8 TiB RWX PVC. Each
+rank checksum-checks its shard and publishes an immutable receipt; rank 0
+requires all four receipts and then publishes the manifest only after checking
 every episode. `stage-dinov3` downloads the private URL quietly, validates the
 full checksum, and atomically publishes the artifact into the checkpoint PVC.
 `stage-released` downloads Meta's pinned DROID world-model release once through
@@ -187,10 +189,13 @@ full SHA-256. Setup refuses missing, non-`8aa4cbdd` or mismatched artifacts. The
 DINOv3 code checkout is independently pinned to
 `54694f7627fd815f62a5dcc82944ffa6153bbb76`.
 
-The DROID stage is an idempotent `gsutil rsync` from
-`gs://gresearch/robotics/droid_raw`, excluding SVO and stereo MP4 data (about
-5.6 TB). The live `1.0.1` source contained 74,970 trajectory objects when
-enumerated on 2026-08-15. Staging relists that official source after the copy
+The Kubernetes DROID stage uses pinned rclone v1.73.5 to copy and checksum-check
+four disjoint institution shards from `gs://gresearch/robotics/droid_raw`,
+excluding SVO and stereo MP4 data (about 5.6 TB). Its local `Colon` encoding
+maps source U+003A to SharedFS-compatible U+FF1A and records both source and
+staged inventory fingerprints; a pre-existing U+FF1A or mapping collision is
+rejected. (The optional GCS-to-GCS profile retains idempotent `gsutil rsync`.)
+The live `1.0.1` source contains 74,970 trajectory objects. Staging relists that official source after the copy
 and requires the staged trajectory IDs to match it exactly, so a partial raw
 mirror cannot pass merely by exceeding a loose count threshold. It creates
 `DROID/droid_paths.csv` and a fingerprinted
