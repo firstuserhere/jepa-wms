@@ -20,6 +20,7 @@ RCLONE_VERSION = "v1.73.5"
 RCLONE_LOCAL_ENCODING = "Slash,Colon,InvalidUtf8,Dot"
 ASCII_COLON = ":"
 FULLWIDTH_COLON = "："
+RCLONE_PARTIAL_NAME = re.compile(r".+\.[0-9a-f]{8}\.partial$")
 
 
 def encode_source_episode_id(episode_id: str) -> str:
@@ -47,6 +48,33 @@ def encode_source_episode_ids(episode_ids: list[str]) -> list[str]:
         preview = [values for values in collisions.values() if len(values) > 1][:3]
         raise ValueError(f"DROID path encoding is not bijective; collisions={preview}")
     return encoded
+
+
+def remove_stale_rclone_partials(root: Path) -> list[str]:
+    """Remove only rclone's randomized local temporary files below ``root``.
+
+    Interrupted copies can leave ``NAME.<8 lowercase hex>.partial`` files.
+    A subsequent ``rclone copy`` correctly ignores these unrelated destination
+    objects, while strict ``rclone check`` rejects them.  Cleanup is therefore
+    explicit, confined to one already-validated institution directory, and
+    rejects symlinks rather than following or deleting them.
+    """
+
+    root = root.resolve(strict=True)
+    if not root.is_dir():
+        raise NotADirectoryError(f"Rclone partial cleanup root is not a directory: {root}")
+    removed: list[str] = []
+    for path in sorted(root.rglob("*.partial")):
+        if not RCLONE_PARTIAL_NAME.fullmatch(path.name):
+            continue
+        if path.is_symlink():
+            raise RuntimeError(f"Refusing to remove symlink matching rclone partial pattern: {path}")
+        if not path.is_file():
+            raise RuntimeError(f"Rclone partial candidate is not a regular file: {path}")
+        relative = path.relative_to(root).as_posix()
+        path.unlink()
+        removed.append(relative)
+    return removed
 
 
 def _path_encoding_descriptor(encoded: bool) -> dict[str, object]:
@@ -363,7 +391,12 @@ def main() -> None:
     parser.add_argument("--bind-franka-manifest", type=Path)
     parser.add_argument("--franka-staged-root", type=Path)
     parser.add_argument("--franka-source-root", type=Path)
+    parser.add_argument("--cleanup-rclone-partials", type=Path)
     args = parser.parse_args()
+    if args.cleanup_rclone_partials is not None:
+        removed = remove_stale_rclone_partials(args.cleanup_rclone_partials)
+        print(f"Removed {len(removed)} stale rclone partial file(s)")
+        return
     if args.bind_franka_manifest is not None:
         if args.franka_staged_root is None or args.franka_source_root is None:
             parser.error("--bind-franka-manifest requires both Franka roots")

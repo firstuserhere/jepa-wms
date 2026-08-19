@@ -11,6 +11,7 @@ from infra.skypilot.stage_droid import (
     encode_source_episode_id,
     encode_source_episode_ids,
     list_episode_ids_local,
+    remove_stale_rclone_partials,
     write_artifacts,
 )
 
@@ -21,6 +22,34 @@ def test_anonymous_rclone_remote_is_restricted_to_official_droid():
     )
     with pytest.raises(ValueError, match="restricted to the official DROID source"):
         _anonymous_rclone_droid_remote("gs://private-bucket/datasets")
+
+
+def test_stale_rclone_partial_cleanup_is_narrow_and_symlink_safe(tmp_path: Path):
+    root = tmp_path / "IPRL"
+    episode = root / "success" / "episode"
+    episode.mkdir(parents=True)
+    stale = episode / "trajectory.h5.29614ff4.partial"
+    stale.write_bytes(b"incomplete")
+    non_hex = episode / "trajectory.h5.29614fg4.partial"
+    non_hex.write_bytes(b"not-rclone-pattern")
+    wrong_width = episode / "trajectory.h5.29614ff.partial"
+    wrong_width.write_bytes(b"not-rclone-pattern")
+    source_file = episode / "trajectory.h5"
+    source_file.write_bytes(b"complete")
+
+    assert remove_stale_rclone_partials(root) == [
+        "success/episode/trajectory.h5.29614ff4.partial"
+    ]
+    assert not stale.exists()
+    assert non_hex.exists()
+    assert wrong_width.exists()
+    assert source_file.exists()
+
+    symlink = episode / "trajectory.h5.deadbeef.partial"
+    symlink.symlink_to(source_file)
+    with pytest.raises(RuntimeError, match="Refusing to remove symlink"):
+        remove_stale_rclone_partials(root)
+    assert symlink.is_symlink()
 
 
 def _write_verified_manifest(path: Path) -> None:

@@ -252,6 +252,7 @@ def test_pvc_staging_creates_and_checks_local_rsync_targets():
     assert '"$rclone" check "$source_remote/$lab" "$droid_target/1.0.1/$lab"' in run
     assert "encode_source_episode_ids(source_ids)" in run
     assert 'export JEPAWM_RCLONE="$rclone"' in run
+    assert '--cleanup-rclone-partials "$droid_target/1.0.1/$lab"' in run
     assert 'JEPAWM_STAGE_PREFILL_ONLY' in run
     assert '0) labs=(RAD)' in run
     assert '1) labs=(RPL)' in run

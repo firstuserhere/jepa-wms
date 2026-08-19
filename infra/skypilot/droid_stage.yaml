@@ -141,6 +141,8 @@ run: |
     )
     for lab in "${labs[@]}"; do
       mkdir -p "$droid_target/1.0.1/$lab"
+      python3 infra/skypilot/stage_droid.py \
+        --cleanup-rclone-partials "$droid_target/1.0.1/$lab"
       "$rclone" copy "$source_remote/$lab" "$droid_target/1.0.1/$lab" \
         "${rclone_common[@]}" --checksum --transfers 32
       "$rclone" check "$source_remote/$lab" "$droid_target/1.0.1/$lab" \
