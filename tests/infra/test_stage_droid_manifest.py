@@ -178,6 +178,29 @@ def test_colon_episode_ids_are_encoded_and_bound_to_original_source(tmp_path: Pa
     ]
 
 
+def test_encoded_source_inventory_is_sorted_in_staged_namespace(tmp_path: Path, monkeypatch):
+    root = tmp_path / "mounted"
+    source_ids = ["lab/A:B", "lab/Aa"]
+    staged_ids = ["lab/Aa", "lab/A：B"]
+    for staged_id in staged_ids:
+        episode = root / "droid_raw" / "1.0.1" / staged_id
+        episode.mkdir(parents=True)
+        (episode / "trajectory.h5").write_bytes(b"trajectory")
+    monkeypatch.setattr(stage_droid, "list_episode_ids_gcs", lambda _uri: source_ids)
+
+    write_artifacts(
+        target_uri=None,
+        target_root=root,
+        staged_identity="sky-volume://droid-volume/droid_raw/1.0.1",
+        expected_source_root_uri="gs://gresearch/robotics",
+        mount_root="/mnt/jepawm-datasets",
+        min_episodes=2,
+        output_dir=tmp_path / "output",
+    )
+
+    assert list_episode_ids_local(root) == staged_ids
+
+
 def test_path_encoding_rejects_reserved_fullwidth_colon():
     with pytest.raises(ValueError, match="reserved U\\+FF1A"):
         encode_source_episode_ids(["lab/A：B"])

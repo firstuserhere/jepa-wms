@@ -309,7 +309,7 @@ def write_artifacts(
         expected_source_root_uri = validate_gs_uri(expected_source_root_uri)
         source_episode_ids = list_episode_ids_gcs(expected_source_root_uri)
         expected_staged_ids = (
-            encode_source_episode_ids(source_episode_ids)
+            sorted(encode_source_episode_ids(source_episode_ids))
             if target_root is not None
             else source_episode_ids
         )
