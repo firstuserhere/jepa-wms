@@ -100,7 +100,11 @@ infra/skypilot/launch_k8s.sh full \
 shards of the public filtered raw DROID release into the 8 TiB RWX PVC. Each
 rank checksum-checks its shard and publishes an immutable receipt; rank 0
 requires all four receipts and then publishes the manifest only after checking
-every episode. `stage-dinov3` downloads the private URL quietly, validates the
+every episode. While an authoritative stage is in its first prefix, `stage-prefill`
+may use four additional nodes to copy and checksum-check only the final disjoint
+prefix of each shard (`RAD`, `RPL`, `CLVR`/`GuptaLab`, and `RAIL`). It publishes
+no receipt or manifest; the authoritative stage still rechecks those bytes before
+publication. `stage-dinov3` downloads the private URL quietly, validates the
 full checksum, and atomically publishes the artifact into the checkpoint PVC.
 `stage-released` downloads Meta's pinned DROID world-model release once through
 the managed HF identity, verifies its full SHA-256, and atomically publishes it

@@ -22,6 +22,10 @@ envs:
   DROID_STORE_URI: gs://replace-me-jepawm-datasets
   JEPAWM_STORAGE_BACKEND: gcs
   DROID_VOLUME_NAME: ""
+  # Optional acceleration mode.  It copies and verifies only late, disjoint
+  # institution prefixes, publishes no manifest, and leaves the authoritative
+  # four-node stage to re-check every byte before publication.
+  JEPAWM_STAGE_PREFILL_ONLY: "0"
 
 secrets:
   - secrets:HF_TOKEN
@@ -94,7 +98,7 @@ run: |
     chmod 0555 "$rclone"
     test "$($rclone version | sed -n '1p')" = "rclone v1.73.5"
     export JEPAWM_RCLONE="$rclone"
-    if [[ "$node_rank" == 0 ]]; then
+    if [[ "$node_rank" == 0 && "$JEPAWM_STAGE_PREFILL_ONLY" != 1 ]]; then
       python3 - <<'PY'
   from infra.skypilot.stage_droid import encode_source_episode_ids, list_episode_ids_gcs
 
@@ -105,13 +109,26 @@ run: |
   print(f"Preflighted collision-free DROID path encoding for {len(encoded_ids)} episodes")
   PY
     fi
-    case "$node_rank" in
-      0) labs=(TRI PennPAL RAD) ;;
-      1) labs=(AUTOLab WEIRD RPL) ;;
-      2) labs=(IPRL ILIAD CLVR GuptaLab) ;;
-      3) labs=(IRIS REAL RAIL) ;;
-      *) echo "Unexpected staging node rank: $node_rank" >&2; exit 2 ;;
-    esac
+    if [[ "$JEPAWM_STAGE_PREFILL_ONLY" == 1 ]]; then
+      # These are the final prefixes of the four authoritative shards.  Starting
+      # them only after the main job is already copying its first prefix avoids
+      # concurrent writers while removing the sequential long tail.
+      case "$node_rank" in
+        0) labs=(RAD) ;;
+        1) labs=(RPL) ;;
+        2) labs=(CLVR GuptaLab) ;;
+        3) labs=(RAIL) ;;
+        *) echo "Unexpected prefill node rank: $node_rank" >&2; exit 2 ;;
+      esac
+    else
+      case "$node_rank" in
+        0) labs=(TRI PennPAL RAD) ;;
+        1) labs=(AUTOLab WEIRD RPL) ;;
+        2) labs=(IPRL ILIAD CLVR GuptaLab) ;;
+        3) labs=(IRIS REAL RAIL) ;;
+        *) echo "Unexpected staging node rank: $node_rank" >&2; exit 2 ;;
+      esac
+    fi
     source_remote=':gcs,anonymous=true:gresearch/robotics/droid_raw/1.0.1'
     rclone_common=(
       --exclude '**SVO**'
@@ -129,6 +146,11 @@ run: |
       "$rclone" check "$source_remote/$lab" "$droid_target/1.0.1/$lab" \
         "${rclone_common[@]}"
     done
+
+    if [[ "$JEPAWM_STAGE_PREFILL_ONLY" == 1 ]]; then
+      echo "DROID late-shard prefill completed and checksum-verified: ${labs[*]}"
+      exit 0
+    fi
 
     receipt_dir="/mnt/jepawm-datasets/.staging/$SKYPILOT_TASK_ID"
     mkdir -p "$receipt_dir"

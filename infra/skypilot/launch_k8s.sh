@@ -6,7 +6,7 @@ usage() {
   echo "       [--run-id ID [--resume]] [--distributed-smoke-run-id ID]" >&2
   echo "       [--qualification-run-id ID] [--runtime-readiness-run-id ID]" >&2
   echo "       [--git-url URL --git-ref COMMIT] [--priority p0|p1|p2|p3|p4] [--dry-run]" >&2
-  echo "MODE: preflight | stage | stage-dinov3 | stage-released | distributed-smoke | qualify | train-smoke | full" >&2
+  echo "MODE: preflight | stage | stage-prefill | stage-dinov3 | stage-released | distributed-smoke | qualify | train-smoke | full" >&2
 }
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -101,7 +101,7 @@ if [[ "$mode" == preflight ]]; then
 fi
 
 case "$mode" in
-  stage)
+  stage|stage-prefill)
     task_spec=infra/skypilot/droid_stage.yaml
     [[ -n "$droid_volume" ]] || { echo "--droid-volume is required" >&2; exit 2; }
     ;;
@@ -202,6 +202,7 @@ if "Kubernetes" not in capabilities or "compute" not in capabilities["Kubernetes
 PY
 
 launch_env=()
+[[ "$mode" != stage-prefill ]] || launch_env+=(--env "JEPAWM_STAGE_PREFILL_ONLY=1")
 [[ -z "$dinov3_weights_sha256" ]] || launch_env+=(--env "DINOV3_WEIGHTS_SHA256=$dinov3_weights_sha256")
 [[ -z "$run_id" ]] || launch_env+=(--env "JEPAWM_RUN_ID=$run_id")
 [[ -z "$qualification_run_id" ]] || launch_env+=(--env "JEPAWM_QUALIFICATION_RUN_ID=$qualification_run_id")
