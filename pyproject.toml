@@ -25,6 +25,7 @@ dependencies = [
     "h5py",
     "einops",
     "datasets",  # HuggingFace datasets for loading parquet/arrow data
+    "pyarrow==20.0.0",  # datasets 2.14.4 requires the pre-21 PyExtensionType API
     # Image and video processing
     "opencv-python-headless",
     "pillow",
