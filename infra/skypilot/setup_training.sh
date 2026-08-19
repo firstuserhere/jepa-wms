@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'rc=$?; printf "setup_training failed rc=%s line=%s command=%q\n" "$rc" "$LINENO" "$BASH_COMMAND" >&2; exit "$rc"' ERR
 
 readonly DINOV3_REPO_REVISION="54694f7627fd815f62a5dcc82944ffa6153bbb76"
 readonly DINOV3_WEIGHTS_FILE="dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
@@ -40,13 +41,16 @@ test -z "$(git status --porcelain=v1 --untracked-files=all)"
 uv sync --frozen --extra dev \
   --no-install-package metaworld \
   --no-install-package d4rl
+echo "setup_training: locked environment ready"
 
 if [[ ! -d dinov3/.git ]]; then
-  git clone --filter=blob:none https://github.com/facebookresearch/dinov3.git dinov3
+  git init -q dinov3
+  git -C dinov3 remote add origin https://github.com/facebookresearch/dinov3.git
 fi
 git -C dinov3 fetch --depth=1 origin "$DINOV3_REPO_REVISION"
-git -C dinov3 checkout --detach "$DINOV3_REPO_REVISION"
+git -C dinov3 checkout --detach FETCH_HEAD
 test "$(git -C dinov3 rev-parse HEAD)" = "$DINOV3_REPO_REVISION"
+echo "setup_training: pinned DINOv3 source ready"
 
 mkdir -p .artifacts/dinov3
 weights_path=".artifacts/dinov3/$DINOV3_WEIGHTS_FILE"
@@ -77,3 +81,4 @@ if [[ "$weights_sha256" != "$DINOV3_WEIGHTS_SHA256" ]]; then
   trap - EXIT
 fi
 printf '%s  %s\n' "$DINOV3_WEIGHTS_SHA256" "$DINOV3_WEIGHTS_FILE" > .artifacts/dinov3/weights.sha256
+echo "setup_training: verified native DINOv3 weights ready"

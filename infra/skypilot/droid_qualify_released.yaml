@@ -59,6 +59,7 @@ setup: |
 
 run: |
   set -euo pipefail
+  trap 'rc=$?; printf "qualification startup failed rc=%s line=%s command=%q\n" "$rc" "$LINENO" "$BASH_COMMAND" >&2; exit "$rc"' ERR
   export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
   export JEPAWM_HOME="$PWD"
   export JEPAWM_DSET=/mnt/jepawm-datasets
@@ -78,16 +79,23 @@ run: |
   [[ "${JEPAWM_RESUME:-0}" == 1 ]] && resume_args=(--resume-existing)
   export DINOV3_REPO_PATH="$PWD/dinov3"
   export DINOV3_WEIGHTS_PATH="$PWD/.artifacts/dinov3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
-  test -s "$JEPAWM_DSET/DROID/droid_paths.csv"
-  test -s "$JEPAWM_DSET/DROID/droid_manifest.json"
-  test -d "$JEPAWM_DSET/droid_raw/1.0.1"
-  test -d "$JEPAWM_DSET/franka_custom"
+  require_file() {
+    [[ -s "$1" ]] || { echo "Required non-empty file is unavailable: $1" >&2; return 1; }
+  }
+  require_dir() {
+    [[ -d "$1" ]] || { echo "Required directory is unavailable: $1" >&2; return 1; }
+  }
+  require_file "$JEPAWM_DSET/DROID/droid_paths.csv"
+  require_file "$JEPAWM_DSET/DROID/droid_manifest.json"
+  require_dir "$JEPAWM_DSET/droid_raw/1.0.1"
+  require_dir "$JEPAWM_DSET/franka_custom"
+  echo "qualification startup: DROID and Franka volumes ready"
 
   readonly release_name=jepa_wm_droid.pth.tar
   readonly release_revision=9b9c41ef249466630dbf1a20e78391865d07b3b9
   readonly release_sha256=daa69198aef764932f1cb809239a4e19c71da20a93c6a0b9f3869cb30a13f4aa
   staged_release="$JEPAWM_CKPT/artifacts/releases/jepa_wm_droid-${release_sha256}.pth.tar"
-  test -s "$staged_release"
+  require_file "$staged_release"
   test "$(sha256sum "$staged_release" | awk '{print $1}')" = "$release_sha256"
   test "$(awk '{print $1}' "$staged_release.sha256")" = "$release_sha256"
   test "$(tr -d '\r\n' < "$staged_release.huggingface_revision.txt")" = "$release_revision"
@@ -106,6 +114,7 @@ run: |
     mv "$temporary_release" "$local_release"
   fi
   export RELEASED_DROID_CHECKPOINT_PATH="$local_release"
+  echo "qualification startup: released checkpoint verified and cached"
 
   master_addr="$(printf '%s\n' "$SKYPILOT_NODE_IPS" | sed -n '1p')"
   test -n "$master_addr"
