@@ -26,7 +26,7 @@ dependencies = [
     "einops",
     "datasets",  # HuggingFace datasets for loading parquet/arrow data
     # Image and video processing
-    "opencv-python",
+    "opencv-python-headless",
     "pillow",
     "decord>=0.6.0",
     "imageio",
