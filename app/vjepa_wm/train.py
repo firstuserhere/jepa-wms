@@ -87,6 +87,7 @@ from src.utils.planning_promotion import (
     register_planning_evaluations,
 )
 from src.utils.yaml_utils import convert_to_dict_recursive, dump_yaml, expand_env_vars
+from src.utils.wandb_utils import generate_wandb_run_id
 
 # --
 log_timings = True
@@ -627,7 +628,7 @@ def main(args, resume_preempt=False):
                             "refusing to split an exact continuation across runs"
                         )
                     else:
-                        wandb_run_id = wandb.util.generate_id()
+                        wandb_run_id = generate_wandb_run_id()
                         resume_mode = "never"
                 wandb.init(
                     project=project_name,
