@@ -54,6 +54,81 @@ def test_manifest_records_missing_required_file(tmp_path):
     assert manifest["verification"]["missing_episode_count"] == 1
 
 
+def test_manifest_can_publish_an_accounted_loader_ready_subset(tmp_path):
+    root = tmp_path / "root"
+    valid = _make_episode(root, "valid")
+    no_metadata = _make_episode(root, "no-metadata")
+    (no_metadata / "metadata.json").unlink()
+    no_video = _make_episode(root, "no-video")
+    (no_video / "recordings" / "MP4" / "cam-left.mp4").unlink()
+    paths = tmp_path / "source-paths.csv"
+    paths.write_text(f"{valid}\n{no_metadata}\n{no_video}\n", encoding="utf-8")
+    filtered_paths = tmp_path / "loader-ready.csv"
+
+    manifest = build_manifest(
+        paths,
+        root,
+        filter_loader_unusable=True,
+        filtered_paths_output=filtered_paths,
+        published_path_list_path=Path("/mnt/jepawm-datasets/DROID/droid_paths.csv"),
+    )
+
+    assert manifest["verification"]["complete"] is True
+    assert manifest["source_episode_count"] == 3
+    assert manifest["episode_count"] == 1
+    assert manifest["verification"]["verified_episode_count"] == 1
+    assert manifest["verification"]["filtered_episode_count"] == 2
+    assert manifest["verification"]["unfilterable_error_count"] == 0
+    assert manifest["verification"]["error_category_counts"] == {
+        "missing_camera_video": 1,
+        "no_metadata_json": 1,
+    }
+    assert manifest["loader_ready_filter"]["all_source_episodes_accounted_for"] is True
+    assert manifest["path_list"] == "/mnt/jepawm-datasets/DROID/droid_paths.csv"
+    assert filtered_paths.read_text(encoding="utf-8") == f"{valid} 0\n"
+
+
+def test_loader_ready_filter_does_not_accept_invalid_metadata(tmp_path):
+    root = tmp_path / "root"
+    episode = _make_episode(root, "invalid-json")
+    (episode / "metadata.json").write_text("{", encoding="utf-8")
+    paths = tmp_path / "source-paths.csv"
+    paths.write_text(f"{episode}\n", encoding="utf-8")
+
+    manifest = build_manifest(
+        paths,
+        root,
+        filter_loader_unusable=True,
+        filtered_paths_output=tmp_path / "loader-ready.csv",
+    )
+
+    assert manifest["verification"]["complete"] is False
+    assert manifest["verification"]["unfilterable_error_count"] == 1
+    assert manifest["verification"]["error_category_counts"] == {"invalid_metadata_json": 1}
+    assert manifest["loader_ready_filter"]["all_source_episodes_accounted_for"] is False
+
+
+def test_loader_ready_subset_fingerprint_is_mount_independent(tmp_path):
+    fingerprints = []
+    for mount_name in ("mount-a", "mount-b"):
+        root = tmp_path / mount_name
+        valid = _make_episode(root, "valid")
+        rejected = _make_episode(root, "no-metadata")
+        (rejected / "metadata.json").unlink()
+        paths = tmp_path / f"{mount_name}.csv"
+        paths.write_text(f"{valid}\n{rejected}\n", encoding="utf-8")
+        manifest = build_manifest(
+            paths,
+            root,
+            filter_loader_unusable=True,
+            filtered_paths_output=tmp_path / f"{mount_name}-loader-ready.csv",
+            published_path_list_path=Path("/mnt/jepawm-datasets/DROID/droid_paths.csv"),
+        )
+        fingerprints.append(manifest["dataset_fingerprint"])
+
+    assert fingerprints[0] == fingerprints[1]
+
+
 def test_listing_only_manifest_is_never_marked_complete(tmp_path):
     root = tmp_path / "root"
     episode = _make_episode(root, "episode")

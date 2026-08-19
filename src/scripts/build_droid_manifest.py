@@ -10,6 +10,7 @@ optionally verifies the files the loader will open.
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import json
 import os
@@ -18,10 +19,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_SOURCE_URI = "gs://gresearch/robotics/droid_raw/1.0.1"
 DEFAULT_DATASET_VERSION = "1.0.1"
+LOADER_READY_FILTER_POLICY = "jepa-wm-left-mp4-loader-ready-v1"
+FILTERABLE_ERROR_CODES = frozenset({"no_metadata_json", "missing_camera_video"})
+
+
+class EpisodeVerificationError(Exception):
+    """A deterministic loader-readiness failure with a stable manifest code."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 def _sha256_bytes(chunks: Iterable[bytes]) -> str:
@@ -76,26 +86,28 @@ def canonical_episode_ids(episodes: list[Path], droid_root: Path) -> list[str]:
 def _load_metadata(episode: Path) -> dict:
     json_files = sorted(episode.glob("*.json"))
     if not json_files:
-        raise FileNotFoundError(f"No metadata JSON in {episode}")
+        raise EpisodeVerificationError("no_metadata_json", f"No metadata JSON in {episode}")
     with json_files[0].open("r", encoding="utf-8") as stream:
         return json.load(stream)
 
 
 def verify_episode(episode: Path, camera_key: str) -> dict[str, int | str]:
     if not episode.is_dir():
-        raise FileNotFoundError(f"Missing episode directory: {episode}")
+        raise EpisodeVerificationError("missing_episode_directory", f"Missing episode directory: {episode}")
     trajectory = episode / "trajectory.h5"
     if not trajectory.is_file():
-        raise FileNotFoundError(f"Missing trajectory.h5: {trajectory}")
+        raise EpisodeVerificationError("missing_trajectory", f"Missing trajectory.h5: {trajectory}")
     metadata = _load_metadata(episode)
     if camera_key not in metadata:
-        raise KeyError(f"Metadata in {episode} has no {camera_key!r}")
+        raise EpisodeVerificationError("missing_camera_key", f"Metadata in {episode} has no {camera_key!r}")
     video_name = str(metadata[camera_key]).split("recordings/MP4/")[-1]
     video = episode / "recordings" / "MP4" / video_name
     if not video.is_file():
-        raise FileNotFoundError(f"Missing camera video referenced by metadata: {video}")
+        raise EpisodeVerificationError("missing_camera_video", f"Missing camera video referenced by metadata: {video}")
     if "stereo" in video.name.lower():
-        raise ValueError(f"Configured camera unexpectedly references a stereo video: {video}")
+        raise EpisodeVerificationError(
+            "stereo_camera_video", f"Configured camera unexpectedly references a stereo video: {video}"
+        )
     return {
         "trajectory_bytes": trajectory.stat().st_size,
         "video_bytes": video.stat().st_size,
@@ -112,24 +124,53 @@ def build_manifest(
     camera_key: str = "left_mp4_path",
     verify_files: bool = True,
     source_index_manifest: Path | None = None,
+    filter_loader_unusable: bool = False,
+    filtered_paths_output: Path | None = None,
+    published_path_list_path: Path | None = None,
 ) -> dict:
+    if filter_loader_unusable and not verify_files:
+        raise ValueError("Loader-ready filtering requires full file verification")
+    if filter_loader_unusable and filtered_paths_output is None:
+        raise ValueError("Loader-ready filtering requires filtered_paths_output")
     episodes = read_episode_paths(path_list)
-    episode_ids = canonical_episode_ids(episodes, droid_root)
-    identity_lines = [f"{item}\n".encode("utf-8") for item in sorted(episode_ids)]
+    source_episode_ids = canonical_episode_ids(episodes, droid_root)
+    source_identity_lines = [f"{item}\n".encode("utf-8") for item in sorted(source_episode_ids)]
 
     missing: list[dict[str, str]] = []
+    usable_episodes: list[Path] = []
+    usable_episode_ids: list[str] = []
     verified = 0
     trajectory_bytes = 0
     video_bytes = 0
     if verify_files:
-        for episode_id, episode in zip(episode_ids, episodes):
+        for episode_id, episode in zip(source_episode_ids, episodes):
             try:
                 stats = verify_episode(episode, camera_key)
                 trajectory_bytes += int(stats["trajectory_bytes"])
                 video_bytes += int(stats["video_bytes"])
                 verified += 1
-            except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError) as exc:
-                missing.append({"episode_id": episode_id, "error": str(exc)})
+                usable_episodes.append(episode)
+                usable_episode_ids.append(episode_id)
+            except EpisodeVerificationError as exc:
+                missing.append({"episode_id": episode_id, "code": exc.code, "error": str(exc)})
+            except json.JSONDecodeError as exc:
+                missing.append({"episode_id": episode_id, "code": "invalid_metadata_json", "error": str(exc)})
+            except (FileNotFoundError, OSError) as exc:
+                missing.append({"episode_id": episode_id, "code": "file_read_error", "error": str(exc)})
+    else:
+        usable_episodes = episodes
+        usable_episode_ids = source_episode_ids
+
+    unfilterable = [item for item in missing if item["code"] not in FILTERABLE_ERROR_CODES]
+    filtered = [item for item in missing if item["code"] in FILTERABLE_ERROR_CODES] if filter_loader_unusable else []
+    if filter_loader_unusable:
+        _atomic_write_path_list(usable_episodes, filtered_paths_output)
+        effective_path_list = filtered_paths_output
+        episode_ids = usable_episode_ids
+    else:
+        effective_path_list = path_list
+        episode_ids = source_episode_ids
+    identity_lines = [f"{item}\n".encode("utf-8") for item in sorted(episode_ids)]
 
     source_inventory = None
     path_encoding = None
@@ -142,20 +183,17 @@ def build_manifest(
             "scheme": "identity",
             "schema_version": 1,
         }
-        expected_hash = _sha256_bytes(identity_lines)
+        expected_source_hash = _sha256_bytes(source_identity_lines)
         source_staged_hash = (
-            source_inventory.get("staged_episode_ids_sha256")
-            if isinstance(source_inventory, dict)
-            else None
+            source_inventory.get("staged_episode_ids_sha256") if isinstance(source_inventory, dict) else None
         )
         source_listing_matches_staged = bool(
             source_index.get("verification", {}).get("source_listing_matches_staged")
-            and source_index.get("episode_count") == len(episode_ids)
-            and source_index.get("canonical_episode_ids_sha256") == expected_hash
+            and source_index.get("episode_count") == len(source_episode_ids)
+            and source_index.get("canonical_episode_ids_sha256") == expected_source_hash
             and isinstance(source_inventory, dict)
-            and source_inventory.get("episode_count") == len(episode_ids)
-            and (source_staged_hash or source_inventory.get("canonical_episode_ids_sha256"))
-            == expected_hash
+            and source_inventory.get("episode_count") == len(source_episode_ids)
+            and (source_staged_hash or source_inventory.get("canonical_episode_ids_sha256")) == expected_source_hash
             and isinstance(path_encoding, dict)
         )
         if not source_listing_matches_staged:
@@ -169,10 +207,13 @@ def build_manifest(
         "source_uri": source_uri.rstrip("/"),
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "droid_root": str(droid_root.resolve()),
-        "path_list": str(path_list.resolve()),
-        "path_list_sha256": sha256_file(path_list),
+        "path_list": str((published_path_list_path or effective_path_list).resolve()),
+        "path_list_sha256": sha256_file(effective_path_list),
+        "source_path_list_sha256": sha256_file(path_list),
         "canonical_episode_ids_sha256": _sha256_bytes(identity_lines),
         "episode_count": len(episode_ids),
+        "source_canonical_episode_ids_sha256": _sha256_bytes(source_identity_lines),
+        "source_episode_count": len(source_episode_ids),
         "camera_key": camera_key,
         "source_inventory": source_inventory,
         "path_encoding": path_encoding,
@@ -180,15 +221,35 @@ def build_manifest(
             "files_checked": verify_files,
             "verified_episode_count": verified,
             "missing_episode_count": len(missing),
+            "filtered_episode_count": len(filtered),
+            "unfilterable_error_count": len(unfilterable),
+            "error_category_counts": dict(sorted(collections.Counter(item["code"] for item in missing).items())),
             "required_trajectory_bytes": trajectory_bytes,
             "required_camera_video_bytes": video_bytes,
             "source_listing_matches_staged": source_listing_matches_staged,
             # A listing-only pass is useful for diagnostics but is never a
             # complete research manifest.  Training also checks files_checked.
-            "complete": verify_files and not missing,
+            "complete": verify_files and not unfilterable and (not missing or filter_loader_unusable),
             "errors": missing,
         },
     }
+    if filter_loader_unusable:
+        exclusion_lines = [
+            f"{item['episode_id']}\t{item['code']}\n".encode("utf-8")
+            for item in sorted(filtered, key=lambda item: (item["episode_id"], item["code"]))
+        ]
+        manifest["loader_ready_filter"] = {
+            "policy": LOADER_READY_FILTER_POLICY,
+            "camera_key": camera_key,
+            "allowed_exclusion_codes": sorted(FILTERABLE_ERROR_CODES),
+            "excluded_episode_count": len(filtered),
+            "excluded_episode_records_sha256": _sha256_bytes(exclusion_lines),
+            "all_source_episodes_accounted_for": len(episode_ids) + len(filtered) == len(source_episode_ids),
+        }
+        manifest["verification"]["complete"] = bool(
+            manifest["verification"]["complete"]
+            and manifest["loader_ready_filter"]["all_source_episodes_accounted_for"]
+        )
     identity = {
         key: manifest[key]
         for key in (
@@ -201,6 +262,10 @@ def build_manifest(
             "camera_key",
         )
     }
+    identity["source_episode_count"] = manifest["source_episode_count"]
+    identity["source_canonical_episode_ids_sha256"] = manifest["source_canonical_episode_ids_sha256"]
+    if filter_loader_unusable:
+        identity["loader_ready_filter"] = manifest["loader_ready_filter"]
     if source_inventory is not None:
         identity["source_inventory"] = {
             key: source_inventory[key]
@@ -217,6 +282,29 @@ def build_manifest(
         [json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")]
     )
     return manifest
+
+
+def _atomic_write_path_list(episodes: list[Path], output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp", dir=output.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            for index, episode in enumerate(episodes):
+                stream.write(f"{episode} {index}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+        directory_fd = os.open(output.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def atomic_write_json(document: dict, output: Path) -> None:
@@ -252,6 +340,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-key", default="left_mp4_path")
     parser.add_argument("--source-index-manifest", type=Path)
     parser.add_argument(
+        "--filter-loader-unusable",
+        action="store_true",
+        help="Publish only episodes that the configured raw loader can open; record every exclusion",
+    )
+    parser.add_argument("--filtered-paths-output", type=Path)
+    parser.add_argument(
+        "--published-path-list-path",
+        type=Path,
+        help="Stable mounted path to record in the manifest for the filtered path list",
+    )
+    parser.add_argument(
         "--no-verify-files",
         action="store_true",
         help="Fingerprint only; do not check trajectory/video files (not valid for a full launch gate)",
@@ -269,11 +368,16 @@ def main() -> None:
         camera_key=args.camera_key,
         verify_files=not args.no_verify_files,
         source_index_manifest=args.source_index_manifest,
+        filter_loader_unusable=args.filter_loader_unusable,
+        filtered_paths_output=args.filtered_paths_output,
+        published_path_list_path=args.published_path_list_path,
     )
     atomic_write_json(manifest, args.output)
     if not manifest["verification"]["complete"]:
         raise SystemExit(
-            f"DROID verification failed for {manifest['verification']['missing_episode_count']} episodes; "
+            "DROID verification did not produce a complete loader-ready manifest; "
+            f"unusable={manifest['verification']['missing_episode_count']}, "
+            f"unfilterable={manifest['verification']['unfilterable_error_count']}; "
             f"see {args.output}"
         )
     print(

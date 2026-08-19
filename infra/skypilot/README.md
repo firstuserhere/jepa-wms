@@ -207,7 +207,13 @@ mirror cannot pass merely by exceeding a loose count threshold. It creates
 prefix as `DATASET_RO`. Before publishing that manifest, staging verifies every
 listed episode through the target mount, including `trajectory.h5`,
 metadata, and the referenced left-camera MP4; a listing-only manifest cannot
-pass the strict training gate. It also byte-compares every staged `Franka_hf`
+pass the strict training gate. The public raw snapshot currently has episodes
+with a trajectory object but no metadata or referenced left-camera MP4. Those
+bytes remain in the full mirror, while the loader path list contains only
+verified-openable episodes; the manifest accounts for every source episode and
+binds the exclusion categories, records, and checksum into the dataset
+fingerprint. Unexpected schema or decoding failures remain fatal. It also
+byte-compares every staged `Franka_hf`
 file against `facebook/jepa-wms` dataset revision
 `6116f042ae7ae4c8e3f1fd2f194f432615664182`, records the canonical file list,
 per-file hashes and tree hash, and binds that auxiliary identity into the

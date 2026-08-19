@@ -268,7 +268,10 @@ run: |
     --source-uri gs://gresearch/robotics/droid_raw/1.0.1 \
     --source-index-manifest "$verification_dir/droid_index_manifest.json" \
     --dataset-version 1.0.1 \
-    --camera-key left_mp4_path
+    --camera-key left_mp4_path \
+    --filter-loader-unusable \
+    --filtered-paths-output "$verification_dir/droid_paths.loader-ready.csv" \
+    --published-path-list-path /mnt/jepawm-datasets/DROID/droid_paths.csv
 
   # Bind the exact held-out Franka_hf bytes used by rollout/planning promotion
   # into the same fingerprint.  Compare the staged read-only tree byte-for-byte
@@ -297,6 +300,7 @@ run: |
       raise SystemExit("Combined DROID + Franka_hf full-file verification did not pass")
   PY
 
+  cp "$verification_dir/droid_paths.loader-ready.csv" "$verification_dir/droid_paths.csv"
   if [[ "$JEPAWM_STORAGE_BACKEND" == gcs ]]; then
     gsutil -m cp \
       "$verification_dir/droid_paths.csv" \
