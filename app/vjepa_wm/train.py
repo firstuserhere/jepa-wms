@@ -79,6 +79,7 @@ from src.utils.dataset_manifest import (
     verify_droid_runtime_binding,
 )
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
+from src.utils.mfu import training_performance_stats
 from src.utils.planning_promotion import (
     drain_planning_evaluations,
     load_planning_evaluation_registry,
@@ -356,6 +357,16 @@ def main(args, resume_preempt=False):
     tag = cfgs_logging.get("write_tag", "jepa")
     latest_format = cfgs_logging.get("latest_format", "pth.tar")
     cfgs_wandb = cfgs_logging.get("wandb")
+    cfgs_mfu = cfgs_logging.get("mfu", {})
+    mfu_enabled = bool(cfgs_mfu.get("enabled", False))
+    mfu_peak_dense_tflops = float(cfgs_mfu.get("peak_dense_tflops", 0.0))
+    mfu_measure_epoch = int(cfgs_mfu.get("measure_epoch", 0))
+    mfu_measure_iteration = int(cfgs_mfu.get("measure_iteration", 2))
+    if mfu_enabled:
+        if mfu_peak_dense_tflops <= 0:
+            raise ValueError("logging.mfu.peak_dense_tflops must be positive when MFU is enabled")
+        if mfu_measure_epoch < 0 or mfu_measure_iteration < 0:
+            raise ValueError("logging.mfu measurement coordinates must be non-negative")
 
     if light_eval_only_mode:
         light_eval_freq = 1
@@ -696,6 +707,13 @@ def main(args, resume_preempt=False):
                 logger.info("[%d, %5d] " "loss: %.3f | " % (epoch + 1, itr, log_dict["loss"]))
             if self.use_wandb and rank == 0:
                 wandb.log(log_dict, step=log_dict["global_step"])
+                if "perf/mfu_dense" in log_dict:
+                    current_mfu = float(log_dict["perf/mfu_dense"])
+                    wandb.run.summary["perf/mfu_dense_last"] = current_mfu
+                    previous_max = wandb.run.summary.get("perf/mfu_dense_max")
+                    wandb.run.summary["perf/mfu_dense_max"] = (
+                        current_mfu if previous_max is None else max(float(previous_max), current_mfu)
+                    )
 
         def log_media_local(self, image_stats, epoch=None, itr=None):
             step = epoch * ipe + itr
@@ -1439,6 +1457,7 @@ def main(args, resume_preempt=False):
 
     # -- TRAINING LOOP
     if not (plan_only_eval_mode or unroll_decode_eval_only_mode):
+        measured_training_flops_per_sample = None
         for epoch in range(start_epoch, num_epochs):
             logger.info("\n" + "─" * 50)
             logger.info(f"📈 Epoch {epoch + 1}/{num_epochs}")
@@ -1949,10 +1968,46 @@ def main(args, resume_preempt=False):
                 # In train mode, image_stats is empty
                 if not light_eval_only_mode:
                     obs, action, state, reward, masks_enc, masks_pred = get_batch()
-                    (loss, losses, optim_stats, total_stats, image_stats), gpu_etime_ms = gpu_timer(
-                        lambda: step_model(obs, action, state, reward, train=True)
+                    measure_mfu_step = (
+                        mfu_enabled
+                        and measured_training_flops_per_sample is None
+                        and epoch >= mfu_measure_epoch
+                        and itr == mfu_measure_iteration
                     )
+                    if measure_mfu_step:
+                        from torch.utils.flop_counter import FlopCounterMode
+
+                        with FlopCounterMode(display=False) as flop_counter:
+                            (loss, losses, optim_stats, total_stats, image_stats), gpu_etime_ms = gpu_timer(
+                                lambda: step_model(obs, action, state, reward, train=True)
+                            )
+                        measured_step_flops = float(flop_counter.get_total_flops())
+                        measured_batch_size = int(obs["visual"].shape[0])
+                        if measured_step_flops <= 0 or measured_batch_size <= 0:
+                            raise RuntimeError(
+                                "MFU profiling recorded no training FLOPs or an empty batch"
+                            )
+                        measured_training_flops_per_sample = measured_step_flops / measured_batch_size
+                        logger.info(
+                            "Measured %.3e training FLOPs/sample for MFU telemetry",
+                            measured_training_flops_per_sample,
+                        )
+                    else:
+                        (loss, losses, optim_stats, total_stats, image_stats), gpu_etime_ms = gpu_timer(
+                            lambda: step_model(obs, action, state, reward, train=True)
+                        )
                     iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
+                    if measured_training_flops_per_sample is not None:
+                        total_stats.update(
+                            training_performance_stats(
+                                flops_per_sample=measured_training_flops_per_sample,
+                                local_batch_size=int(obs["visual"].shape[0]),
+                                world_size=world_size,
+                                gpu_elapsed_ms=gpu_etime_ms,
+                                wall_elapsed_ms=iter_elapsed_time_ms,
+                                peak_dense_tflops=mfu_peak_dense_tflops,
+                            )
+                        )
                     loss_meter.update(loss)
                     gpu_time_meter.update(gpu_etime_ms)
                     wall_time_meter.update(iter_elapsed_time_ms)

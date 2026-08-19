@@ -37,6 +37,13 @@ overrides:
       # deterministic after managed-job recovery.
       persistent_workers: false
   logging:
+    mfu:
+      enabled: true
+      # NVIDIA quotes 1,979 BF16 TFLOPS for H200 SXM with sparsity;
+      # dense peak is half that value. MFU must use the dense denominator.
+      peak_dense_tflops: 989.5
+      measure_epoch: 0
+      measure_iteration: 2
     wandb:
       use_wandb: true
       required: true
