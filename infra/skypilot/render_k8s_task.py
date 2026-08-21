@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Render a checked SkyPilot task for the repository's Kubernetes pools.
+"""Render a checked SkyPilot task for Pantheon's Kubernetes H200 pool.
 
 The scientific command remains in the source task.  This renderer changes only
-provider/storage plumbing: GCP bucket mounts become named RWX PVC mounts, and
-provider-specific resource selectors become the known Kubernetes context.  CPU-only
-tasks also follow the cluster's dedicated-CPU contract: no ephemeral-disk request and
-bounded library thread pools.
+provider/storage plumbing: GCP bucket mounts become named RWX PVC mounts,
+Pantheon's canonical shared checkpoint volume is mounted at ``/checkpoints``,
+and current modal-skypilot InfiniBand settings are injected for full-node
+multi-node jobs. CPU-only tasks retain the dedicated-pool thread limits.
 """
 
 from __future__ import annotations
@@ -22,7 +22,11 @@ import yaml
 
 VOLUME_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9.]{0,61}[a-z0-9])?")
 DATASET_MOUNT = "/mnt/jepawm-datasets"
-CHECKPOINT_MOUNT = "/mnt/jepawm-checkpoints"
+ARTIFACT_MOUNT = "/mnt/jepawm-checkpoints"
+CHECKPOINT_MOUNT = "/checkpoints"
+CHECKPOINT_VOLUME = "checkpoints"
+IB_ARTIFACT = Path(__file__).with_name("modal_skypilot_ib_32ce2987.yaml")
+PANTHEON_USER = "kunvar@pantheon.inc"
 CPU_THREAD_ENVS = (
     "OMP_NUM_THREADS",
     "MKL_NUM_THREADS",
@@ -51,12 +55,31 @@ def _validate_volume_name(value: str) -> str:
     return value
 
 
+def _validate_experiment_tag(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
+        raise ValueError("Experiment tags must be 1-128 filesystem-safe characters")
+    return value
+
+
+def _load_infiniband_artifact() -> dict[str, Any]:
+    artifact = yaml.safe_load(IB_ARTIFACT.read_text(encoding="utf-8"))
+    if not isinstance(artifact, dict):
+        raise TypeError(f"Invalid modal-skypilot InfiniBand artifact: {IB_ARTIFACT}")
+    commit = artifact.get("source_commit")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("InfiniBand artifact has no immutable modal-skypilot source commit")
+    return artifact
+
+
 def render_k8s_task(
     document: dict[str, Any],
     *,
     droid_volume: str | None,
     checkpoint_volume: str | None,
     context: str,
+    experiment_tag: str | None = None,
+    pantheon_user: str = PANTHEON_USER,
+    training: bool = False,
 ) -> dict[str, Any]:
     rendered = dict(document)
     resources = dict(rendered.get("resources", {}))
@@ -64,15 +87,17 @@ def render_k8s_task(
     resources.pop("use_spot", None)
     resources.pop("network_tier", None)
     resources.pop("disk_tier", None)
-    resources["infra"] = f"k8s/{context}"
+    resources.pop("disk_size", None)
+    resources.pop("infra", None)
     cpu_only = not resources.get("accelerators")
-    if cpu_only:
-        # This cluster's CPU pool contract forbids any disk_size request: scratch is
-        # node-local /tmp and durable bytes live on the named RWX volumes.
-        resources.pop("disk_size", None)
-    else:
-        # GPU workers still need bounded pod-ephemeral setup/cache headroom.
-        resources["disk_size"] = 100
+    accelerator = str(resources.get("accelerators", ""))
+    accelerator_match = re.fullmatch(r"H200:([1-8])", accelerator)
+    if not cpu_only and accelerator_match is None:
+        raise ValueError("Pantheon GPU tasks must request H200:1 through H200:8")
+    if accelerator_match is not None:
+        gpu_count = int(accelerator_match.group(1))
+        resources["cpus"] = 20 * gpu_count
+        resources["memory"] = 230 * gpu_count
     recovery = resources.get("job_recovery")
     if isinstance(recovery, dict):
         recovery = dict(recovery)
@@ -86,10 +111,12 @@ def render_k8s_task(
         if not droid_volume:
             raise ValueError("This task requires --droid-volume")
         volumes[DATASET_MOUNT] = _validate_volume_name(droid_volume)
-    if CHECKPOINT_MOUNT in source_mounts or CHECKPOINT_MOUNT in volumes:
+    if ARTIFACT_MOUNT in source_mounts or ARTIFACT_MOUNT in volumes:
         if not checkpoint_volume:
             raise ValueError("This task requires --checkpoint-volume")
-        volumes[CHECKPOINT_MOUNT] = _validate_volume_name(checkpoint_volume)
+        volumes[ARTIFACT_MOUNT] = _validate_volume_name(checkpoint_volume)
+    if not cpu_only:
+        volumes[CHECKPOINT_MOUNT] = CHECKPOINT_VOLUME
     if volumes:
         rendered["volumes"] = volumes
 
@@ -105,18 +132,71 @@ def render_k8s_task(
         envs["DROID_VOLUME_NAME"] = droid_volume
     if DATASET_MOUNT in volumes:
         envs["JEPAWM_STORAGE_BACKEND"] = "pvc"
-    if CHECKPOINT_MOUNT in volumes:
+    if ARTIFACT_MOUNT in volumes:
         envs["DINOV3_WEIGHTS_SOURCE_PATH"] = (
-            f"{CHECKPOINT_MOUNT}/artifacts/dinov3/"
+            f"{ARTIFACT_MOUNT}/artifacts/dinov3/"
             "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
         )
         envs["DINOV3_WEIGHTS_URI"] = ""
+    if accelerator_match is not None:
+        if not isinstance(pantheon_user, str) or "@" not in pantheon_user:
+            raise ValueError("Pantheon GPU tasks require the researcher's email identity")
+        tag = _validate_experiment_tag(
+            experiment_tag or str(envs.get("EXPERIMENT_TAG", "REPLACE_WITH_EXPERIMENT_TAG"))
+        )
+        envs.update(
+            {
+                "PANTHEON_USER": pantheon_user,
+                "EXPERIMENT_TAG": tag,
+                "WANDB_RUN_ID": tag,
+                "WANDB_RESUME": "allow",
+                "WANDB_MODE": "online",
+                "WANDB_PROJECT": str(envs.get("WANDB_PROJECT") or "vjepa_wm"),
+                "JEPAWM_PANTHEON_ROOT": f"/checkpoints/{pantheon_user}/{tag}",
+            }
+        )
+        labels = dict(resources.get("labels", {}) or {})
+        if training:
+            labels.pop("telemetry-contract", None)
+            labels.pop("telemetry-opt-out-reason", None)
+        else:
+            labels["telemetry-contract"] = "opt-out"
+            labels["telemetry-opt-out-reason"] = "jepa-wm-qualification-or-infrastructure"
+        resources["labels"] = labels
+
+    num_nodes = int(rendered.get("num_nodes", 1))
+    config = dict(rendered.get("config", {}) or {})
+    kubernetes_config = dict(config.get("kubernetes", {}) or {})
+    if num_nodes > 1 and accelerator == "H200:8":
+        ib = _load_infiniband_artifact()
+        ib_envs = dict(ib["envs"])
+        for key, expected in ib_envs.items():
+            existing = envs.get(key)
+            if existing is not None and str(existing) != str(expected):
+                raise ValueError(
+                    f"Task overrides modal-skypilot InfiniBand setting {key}: {existing!r} != {expected!r}"
+                )
+        envs.update(ib_envs)
+        envs["PANTHEON_INFINIBAND_SOURCE"] = f"modal-skypilot@{ib['source_commit']}"
+        pod_config = dict(ib["pod_config"])
+        metadata = dict(pod_config.get("metadata", {}) or {})
+        annotations = dict(metadata.get("annotations", {}) or {})
+        # Preserve machine-readable provenance in the final submitted object.
+        # The value intentionally names the RDMA contract while the current
+        # shim requests its HCAs through nvidia.com/hostdev.
+        annotations["pantheon.inc/modal-skypilot-ib-source"] = (
+            f"rdma/modal-skypilot@{ib['source_commit']}"
+        )
+        metadata["annotations"] = annotations
+        pod_config["metadata"] = metadata
+        if kubernetes_config.get("pod_config") not in (None, pod_config):
+            raise ValueError("Task pod_config conflicts with current modal-skypilot InfiniBand output")
+        kubernetes_config["pod_config"] = pod_config
     rendered["envs"] = envs
+    rendered["resources"] = resources
     rendered["api_server_access"] = False
 
-    kubernetes_config = dict(rendered.get("config", {}).get("kubernetes", {}) or {})
     kubernetes_config.setdefault("provision_timeout", 3600)
-    config = dict(rendered.get("config", {}) or {})
     config["kubernetes"] = kubernetes_config
     rendered["config"] = config
     return rendered
@@ -146,6 +226,9 @@ def main() -> None:
     parser.add_argument("--droid-volume")
     parser.add_argument("--checkpoint-volume")
     parser.add_argument("--context", default="Skypilot")
+    parser.add_argument("--experiment-tag")
+    parser.add_argument("--pantheon-user", default=PANTHEON_USER)
+    parser.add_argument("--training", action="store_true")
     args = parser.parse_args()
     with args.input.open("r", encoding="utf-8") as stream:
         document = yaml.safe_load(stream)
@@ -156,6 +239,9 @@ def main() -> None:
         droid_volume=args.droid_volume,
         checkpoint_volume=args.checkpoint_volume,
         context=args.context,
+        experiment_tag=args.experiment_tag,
+        pantheon_user=args.pantheon_user,
+        training=args.training,
     )
     atomic_yaml_dump(rendered, args.output)
 

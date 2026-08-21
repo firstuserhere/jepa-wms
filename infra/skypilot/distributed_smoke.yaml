@@ -48,7 +48,16 @@ setup: |
 run: |
   set -euo pipefail
   export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-  export JEPAWM_RUN_ID="${JEPAWM_RUN_ID:-${SKYPILOT_TASK_ID:?SKYPILOT_TASK_ID is required}}"
+  : "${PANTHEON_USER:?PANTHEON_USER is required}"
+  : "${EXPERIMENT_TAG:?EXPERIMENT_TAG is required}"
+  : "${JEPAWM_PANTHEON_ROOT:?JEPAWM_PANTHEON_ROOT is required}"
+  export JEPAWM_RUN_ID="${JEPAWM_RUN_ID:-$EXPERIMENT_TAG}"
+  [[ "$JEPAWM_RUN_ID" == "$EXPERIMENT_TAG" ]] || {
+    echo "JEPAWM_RUN_ID must equal EXPERIMENT_TAG" >&2
+    exit 2
+  }
+  mkdir -p "$JEPAWM_PANTHEON_ROOT/smoke/$JEPAWM_RUN_ID"
+  chmod 777 "$JEPAWM_PANTHEON_ROOT" "$JEPAWM_PANTHEON_ROOT/smoke" "$JEPAWM_PANTHEON_ROOT/smoke/$JEPAWM_RUN_ID"
   if [[ ! "$JEPAWM_RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then
     echo "JEPAWM_RUN_ID is not filesystem-safe" >&2
     exit 2
@@ -64,7 +73,7 @@ run: |
     --max_restarts=0 \
     -m app.torchrun \
     --smoke \
-    --smoke-state "/mnt/jepawm-checkpoints/smoke/$JEPAWM_RUN_ID/distributed_recovery.json" \
+    --smoke-state "$JEPAWM_PANTHEON_ROOT/smoke/$JEPAWM_RUN_ID/distributed_recovery.json" \
     --smoke-fail-once \
     --recovery-exit-code 42 \
     --expected-gpu H200 \

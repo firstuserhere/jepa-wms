@@ -70,8 +70,6 @@ def validate_tasks() -> None:
         raise AssertionError("Full task must request exactly 4 nodes x H200:8")
     if full["resources"].get("network_tier") != "best":
         raise AssertionError("Full task must request network_tier: best")
-    if full["resources"].get("disk_size", 0) < 3000:
-        raise AssertionError("Full task disk must accommodate the 2.5 TB DROID read-through cache")
     full_run = full["run"]
     first_torchrun = full_run.index("torchrun")
     if full_run.index("qualification_receipt.py verify") >= first_torchrun:
@@ -82,15 +80,15 @@ def validate_tasks() -> None:
     if mounts["/mnt/jepawm-datasets"].get("type") != "DATASET_RO":
         raise AssertionError("DROID must be mounted read-only")
     if mounts["/mnt/jepawm-checkpoints"].get("type") != "MODEL_CHECKPOINT_RW":
-        raise AssertionError("Checkpoints must use a read-write checkpoint mount")
+        raise AssertionError("Immutable model artifacts require the dedicated RWX artifact mount")
 
     distributed_smoke = yaml.safe_load(
         (INFRA_DIR / "distributed_smoke.yaml").read_text(encoding="utf-8")
     )
     if distributed_smoke.get("num_nodes") != 2:
         raise AssertionError("Distributed smoke must exercise cross-node NCCL on exactly two nodes")
-    if "${SKYPILOT_TASK_ID:?" not in distributed_smoke.get("run", ""):
-        raise AssertionError("Distributed smoke durable state must be isolated by managed task ID")
+    if "$JEPAWM_PANTHEON_ROOT/smoke/$JEPAWM_RUN_ID" not in distributed_smoke.get("run", ""):
+        raise AssertionError("Distributed smoke durable state must use the canonical experiment root")
     if "--expected-num-nodes 2" not in distributed_smoke.get("run", ""):
         raise AssertionError("Distributed smoke must prove that its ranks span two nodes")
 
@@ -158,9 +156,15 @@ def validate_kubernetes_profile() -> None:
                 else None
             ),
             context="Skypilot",
+            experiment_tag=f"preflight-{filename.removesuffix('.yaml')}",
+            training=filename in {"droid_train_smoke.yaml", "droid_train_full.yaml"},
         )
-        if rendered["resources"].get("infra") != "k8s/Skypilot":
-            raise AssertionError(f"{filename}: Kubernetes profile did not pin the known context")
+        if "infra" in rendered["resources"] or "disk_size" in rendered["resources"]:
+            raise AssertionError(f"{filename}: rendered Pantheon task retained forbidden resources")
+        if rendered["resources"].get("accelerators") and rendered["volumes"].get("/checkpoints") != "checkpoints":
+            raise AssertionError(f"{filename}: rendered task lacks canonical /checkpoints volume")
+        if rendered.get("num_nodes", 1) > 1 and not rendered.get("config", {}).get("kubernetes", {}).get("pod_config"):
+            raise AssertionError(f"{filename}: rendered multi-node task lacks modal-skypilot InfiniBand")
         if "file_mounts" in rendered:
             raise AssertionError(f"{filename}: Kubernetes profile retained a cloud-bucket mount")
         sky.Task.from_yaml_config(copy.deepcopy(rendered))
@@ -225,6 +229,13 @@ def validate_overlays() -> None:
         raise AssertionError("W&B must be required")
     if quality["logging"]["wandb"].get("required_online") is not True:
         raise AssertionError("W&B must be online, not merely locally buffered")
+    if quality["logging"]["wandb"].get("disable_wandb_media") is not False:
+        raise AssertionError("Pantheon quality runs must publish validation media to W&B")
+    if quality["logging"]["wandb"].get("log_media_locally") is not True:
+        raise AssertionError("Pantheon quality runs must retain durable local media copies")
+    mfu = quality["logging"].get("mfu", {})
+    if mfu.get("telemetry_interval_steps") != 1 or mfu.get("heartbeat_interval_seconds") != 10:
+        raise AssertionError("training-v1 must log every step and heartbeat every ten seconds")
     checkpointing = quality["checkpointing"]
     if not checkpointing.get("enabled") or not checkpointing.get("strict_continuation"):
         raise AssertionError("Strict resumable checkpointing must be enabled")
@@ -236,9 +247,13 @@ def validate_overlays() -> None:
         raise AssertionError("Complete Git source provenance must be required")
     if checkpointing.get("keep_recent") != 3:
         raise AssertionError("Quality training must retain three independent recent fallbacks")
+    if checkpointing.get("epoch_boundary_only") is not True:
+        raise AssertionError("Continuation checkpoints must remain epoch-boundary-only")
+    if checkpointing.get("save_every_epochs") != 1 or checkpointing.get("max_epoch_boundary_seconds") != 300:
+        raise AssertionError("Every epoch boundary must publish within the five-minute loss budget")
     expected_promotion = {
         "enabled": True,
-        "every_epochs": 1,
+        "every_epochs": 6,
         "loader_index": 0,
         "sampler_epoch": 0,
         "seed": 50234,
@@ -249,6 +264,8 @@ def validate_overlays() -> None:
     }
     if checkpointing.get("rollout_promotion") != expected_promotion:
         raise AssertionError("best_rollout promotion corpus is not the fixed Franka_hf suite")
+    if quality.get("evals", {}).get("eval_cfg_paths") != []:
+        raise AssertionError("Planning must run outside the 32-GPU training allocation")
     expected_revision = "54694f7627fd815f62a5dcc82944ffa6153bbb76"
     if quality["model"]["visual_encoder"].get("pretrain_enc_repo_revision") != expected_revision:
         raise AssertionError("DINOv3 repository revision is not pinned")

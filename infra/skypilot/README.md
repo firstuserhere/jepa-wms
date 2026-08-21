@@ -5,14 +5,14 @@ only operational requirements on top: strict continuation, required W&B,
 pinned DINOv3 artifacts, durable checkpoint roles, and a canonical planning
 promotion suite.
 
-> **Current-state notice (2026-08-19):** Read
+> **Current-state notice (2026-08-21):** Read
 > [`../../docs/RESEARCH_STATUS.md`](../../docs/RESEARCH_STATUS.md) and
 > [`../../docs/OPERATIONS.md`](../../docs/OPERATIONS.md) before using this
 > command reference. The two named JEPA-WM volumes already exist and DROID is
-> staged; do not recreate them. The current Kubernetes renderer also predates
-> Pantheon's latest no-`infra`/no-`disk_size` task contract and must be updated
-> and revalidated before another launch. Released qualification is incomplete,
-> and neither the real training smoke nor full training has run.
+> staged; do not recreate them. The renderer now satisfies Pantheon's current
+> no-`infra`/no-`disk_size`, canonical `/checkpoints`, resource-shape, and
+> modal-skypilot InfiniBand contract. Released qualification is still
+> incomplete, and neither the real training smoke nor full training has run.
 
 The intended order is:
 
@@ -99,6 +99,7 @@ infra/skypilot/launch_k8s.sh train-smoke \
   --git-url "$GIT_URL" --git-ref "$GIT_REF" --workspace "$SKY_WORKSPACE"
 
 infra/skypilot/launch_k8s.sh full \
+  --run-id jepawm-droid-dinov3-baseline-001 \
   --qualification-run-id "$QUALIFICATION_RUN_ID" \
   --runtime-readiness-run-id "$TRAIN_SMOKE_RUN_ID" \
   --droid-volume "$DROID_VOLUME" \
@@ -120,7 +121,10 @@ full checksum, and atomically publishes the artifact into the checkpoint PVC.
 `stage-released` downloads Meta's pinned DROID world-model release once through
 the managed HF identity, verifies its full SHA-256, and atomically publishes it
 for all qualification nodes.
-Training copies that verified artifact into each node's local source tree.
+Training copies that verified artifact into each node's local source tree. The
+personal 2 TiB PVC is an artifact source, not the Pantheon checkpoint target.
+Rendered GPU tasks additionally mount `/checkpoints: checkpoints`; every run
+writes under `/checkpoints/$PANTHEON_USER/$EXPERIMENT_TAG`.
 
 Add `--dry-run` to any Kubernetes command to render its provider/storage
 profile and run Sky schema validation without checking secrets, creating a
@@ -228,8 +232,9 @@ byte-compares every staged `Franka_hf`
 file against `facebook/jepa-wms` dataset revision
 `6116f042ae7ae4c8e3f1fd2f194f432615664182`, records the canonical file list,
 per-file hashes and tree hash, and binds that auxiliary identity into the
-combined dataset fingerprint. Checkpoints use a separate parameterized
-`MODEL_CHECKPOINT_RW` cached mount with immediate write-back.
+combined dataset fingerprint. The parameterized `MODEL_CHECKPOINT_RW` mount
+holds immutable DINO/released artifacts. Training checkpoints, receipts, logs,
+and W&B sidecars use the canonical shared `/checkpoints` filesystem.
 
 The qualification task downloads
 `facebook/jepa-wms@9b9c41ef249466630dbf1a20e78391865d07b3b9`'s
@@ -244,14 +249,11 @@ as qualification-only diagnostics.
 from the released config (`Franka_hf`, 5 frames, batch 4, no drop-last,
 `exterior_image_2_left`), sampler epoch 0, seed 50234, the first 64 distributed
 batches on the fixed 32-rank topology, and visual-L2 horizons 1–4. It runs every
-epoch. The full task runs only the canonical CEM planning promotion suite;
-additional planners run only in qualification jobs. Planning itself uses only
-ranks 0–7 (one physical node), preserving the released rank-dependent episode
-partition and random streams exactly; ranks 8–31 wait outside planner
-collectives. This synchronous fallback spends less cluster capacity efficiently
-than upstream's Slurm-submitted asynchronous jobs, but it does not change the
-scientific comparison and it remains recoverable from the immutable pending
-checkpoint.
+six epochs and at the final epoch, after the recovery checkpoint is already
+durable. Planning runs as a separate immutable-checkpoint evaluation, not
+synchronously inside the 32-GPU training allocation; qualification retains all
+eight released planner suites and the exact ranks 0–7 sampling topology. This
+preserves comparability without making 24 training GPUs wait.
 
 Rank zero publishes `released_droid/QUALIFIED.json` only after both released
 evaluations are complete. The receipt binds the released Hub revision and
@@ -263,6 +265,17 @@ dataset, DINO bytes, and Git commit before initializing torchrun. A stale,
 partial, differently configured, or merely hand-asserted qualification cannot
 unlock the allocation.
 
+For a qualification tag `Q` and runtime-smoke tag `R`, the required files are:
+
+```text
+/checkpoints/$PANTHEON_USER/Q/checkpoints/qualification/Q/released_droid/QUALIFIED.json
+/checkpoints/$PANTHEON_USER/R/checkpoints/R/run_metadata/RUNTIME_READY.json
+```
+
+These filenames are never created as placeholders. Their publishers use atomic
+replacement only after every bound result validates; `full` fails closed if
+either file is missing, partial, stale, or checksum-incompatible.
+
 Each successful role promotion also writes a checksum-bound receipt beside
 the immutable object. This is essential for asynchronous planning: the
 checkpoint hash remains the exact object that was evaluated, while the receipt
@@ -272,9 +285,11 @@ reports episode success, so DROID `best_planning` correctly minimizes XYZ goal
 endpoint error and reports the corresponding DROID Action Score; simulator
 tasks use actual episode success.
 
-By default, each training/qualification task uses its stable
-`SKYPILOT_TASK_ID` as `JEPAWM_RUN_ID`, so managed recovery reuses the exact log,
-checkpoint and W&B identity. For a named new experiment add `--run-id NAME`.
+Every distributed smoke, training smoke, qualification, and full-training task
+requires `--run-id NAME`. The renderer sets `EXPERIMENT_TAG`, `WANDB_RUN_ID`,
+and the durable root from that exact value; the worker fails if
+`JEPAWM_RUN_ID != EXPERIMENT_TAG`. Managed recovery therefore reuses the exact
+log, checkpoint, receipt, and W&B identity.
 To intentionally continue an existing named run, add both `--run-id NAME` and
 `--resume`; without that explicit opt-in, an existing or ambiguously populated
 run directory is rejected before training.
@@ -296,7 +311,10 @@ strictly resumes from epoch 1/update 8 through epoch 2/update 16, rank zero
 loads and validates the resulting schema-v2 checkpoint and publishes
 `RUNTIME_READY.json`. That checksum-protected receipt binds both controlled
 recoveries, their W&B identities, the source commit, exact dataset manifest,
-DINOv3 identity, resume contract and final checkpoint. `full` requires the
+DINOv3 identity, resume contract, final checkpoint, both measured
+epoch-boundary durations, and checksum-bound `training_v1_snapshot.json`.
+Each checkpoint is published before rollout/planning evaluation, and the smoke
+is rejected if epoch plus checkpoint exceeds 300 seconds. `full` requires the
 training-smoke run ID and verifies this receipt in addition to the released
 qualification receipt; neither smoke can be skipped by relying on the runbook
 alone.

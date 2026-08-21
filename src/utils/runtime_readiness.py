@@ -10,6 +10,7 @@ from typing import Any
 
 from src.utils.checkpointing import CheckpointManager, atomic_json_dump, sha256_file, validate_checkpoint_v2
 from src.utils.planning_promotion import canonical_sha256
+from src.utils.training_telemetry import validate_telemetry_snapshot_document
 
 
 RUNTIME_READINESS_SCHEMA_VERSION = 1
@@ -114,6 +115,44 @@ def _verify_training_smoke(
         raise RuntimeReadinessError("training smoke did not preserve its W&B identity")
     if first.get("resume_contract_sha256") != final.get("resume_contract_sha256"):
         raise RuntimeReadinessError("training smoke changed its mathematical resume contract")
+    for label, checkpoint_evidence in (("first", first), ("final", final)):
+        if checkpoint_evidence.get("epoch_boundary_only") is not True:
+            raise RuntimeReadinessError(f"training smoke {label} checkpoint was not epoch-boundary-only")
+        elapsed = checkpoint_evidence.get("epoch_boundary_seconds")
+        budget = checkpoint_evidence.get("checkpoint_loss_budget_seconds")
+        if (
+            not isinstance(elapsed, (int, float))
+            or not isinstance(budget, (int, float))
+            or elapsed <= 0
+            or budget <= 0
+            or elapsed > budget
+            or budget > 300
+            or checkpoint_evidence.get("checkpoint_within_loss_budget") is not True
+        ):
+            raise RuntimeReadinessError(
+                f"training smoke {label} checkpoint does not prove the five-minute work-loss budget"
+            )
+        if not _SHA256.fullmatch(str(checkpoint_evidence.get("telemetry_snapshot_sha256", ""))):
+            raise RuntimeReadinessError(f"training smoke {label} checkpoint has no telemetry snapshot digest")
+        telemetry_path = checkpoint_evidence.get("telemetry_snapshot_path")
+        if not telemetry_path or sha256_file(telemetry_path) != checkpoint_evidence["telemetry_snapshot_sha256"]:
+            raise RuntimeReadinessError(f"training smoke {label} telemetry snapshot changed")
+        telemetry_document = _load_json(telemetry_path)
+        heartbeat_at = telemetry_document.get("summary", {}).get(
+            "pantheon_telemetry/heartbeat_at"
+        )
+        try:
+            validate_telemetry_snapshot_document(
+                telemetry_document,
+                expected_active_step=int(checkpoint_evidence["global_update"]),
+                now=float(heartbeat_at),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeReadinessError(
+                f"training smoke {label} telemetry snapshot is invalid: {error}"
+            ) from error
+        if checkpoint_evidence.get("telemetry_wandb_url") is None:
+            raise RuntimeReadinessError(f"training smoke {label} has no canonical W&B URL")
 
     manager = CheckpointManager(checkpoint_root)
     alias = manager.read_alias("latest", verify=True)

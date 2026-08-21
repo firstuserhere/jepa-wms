@@ -18,6 +18,9 @@ explicit dated revision, rationale, and new experiment identity.
 | 2026-08-19 | Require continuous model-aware effective MFU for the dashboard. | The existing selected-step profiler is diagnostic only and must be extended before full training. |
 | 2026-08-19 | Use immutable dated Git tags as multi-agent bases. | Every Cursor agent works in its own worktree/branch from a resolved commit SHA. |
 | 2026-08-19 | Treat every Sky mutation and priority as a fresh operator decision. | Earlier p0 or cancellation approval is not standing authorization. |
+| 2026-08-21 | Keep recovery checkpoints epoch-boundary-only and publish them before evaluation. | Every epoch is durable before rollout/planning; the runtime smoke must prove epoch plus checkpoint is at most 300 seconds. |
+| 2026-08-21 | Use Pantheon's shared `/checkpoints` volume for run state and the personal 2 TiB PVC only for immutable source artifacts. | Final tasks satisfy the platform mount contract and isolate state by Pantheon user and experiment tag. |
+| 2026-08-21 | Keep planning outside the 32-GPU training allocation. | Released eight-rank planning remains comparable without depressing training MFU by idling 24 ranks. |
 
 ## Experiment naming
 

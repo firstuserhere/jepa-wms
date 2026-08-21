@@ -196,6 +196,27 @@ def _checkpoint_snapshot(params: dict[str, Any]) -> dict[str, Any]:
     validate_checkpoint_v2(checkpoint)
     reference = alias["checkpoint"]
     manifest = checkpoint["manifest"]
+    timing_path = checkpoint_folder / "run_metadata" / "epoch_boundary_timing.json"
+    telemetry_path = (
+        checkpoint_folder
+        / "run_metadata"
+        / f"training_v1_step-{int(checkpoint['progress']['global_update']):012d}.json"
+    )
+    try:
+        timing = json.loads(timing_path.read_text(encoding="utf-8"))
+        telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError) as error:
+        raise FileNotFoundError(
+            "latest checkpoint is not yet accompanied by epoch timing and training-v1 telemetry"
+        ) from error
+    if timing.get("epoch") != int(checkpoint["progress"]["epoch"]):
+        raise RuntimeError("epoch-boundary timing does not describe the latest checkpoint")
+    summary = telemetry.get("summary", {})
+    if summary.get("pantheon_telemetry/contract_version") != "training-v1":
+        raise RuntimeError("latest checkpoint has no valid training-v1 telemetry snapshot")
+    if summary.get("pantheon_telemetry/active_step") != int(checkpoint["progress"]["global_update"]):
+        raise RuntimeError("training-v1 telemetry does not describe the latest checkpoint")
+    telemetry_sha256 = hashlib.sha256(telemetry_path.read_bytes()).hexdigest()
     return {
         "epoch": int(checkpoint["progress"]["epoch"]),
         "global_update": int(checkpoint["progress"]["global_update"]),
@@ -208,6 +229,15 @@ def _checkpoint_snapshot(params: dict[str, Any]) -> dict[str, Any]:
         "encoder_repo_revision": manifest["encoder"]["repo_revision"],
         "encoder_weights_sha256": manifest["encoder"]["weights_sha256"],
         "resume_contract_sha256": manifest["resume_contract"]["sha256"],
+        "epoch_boundary_only": timing.get("epoch_boundary_only"),
+        "epoch_boundary_seconds": timing.get("epoch_boundary_seconds"),
+        "checkpoint_seconds": timing.get("checkpoint_seconds"),
+        "checkpoint_loss_budget_seconds": timing.get("loss_budget_seconds"),
+        "checkpoint_within_loss_budget": timing.get("within_loss_budget"),
+        "telemetry_snapshot_path": str(telemetry_path),
+        "telemetry_snapshot_sha256": telemetry_sha256,
+        "telemetry_effective_mfu": summary.get("pantheon_telemetry/effective_mfu"),
+        "telemetry_wandb_url": summary.get("pantheon_telemetry/wandb_url"),
     }
 
 

@@ -35,23 +35,36 @@ def test_k8s_profile_replaces_only_provider_and_storage_plumbing():
         droid_volume="jepawm-droid",
         checkpoint_volume="jepawm-checkpoints",
         context="Skypilot",
+        experiment_tag="jepawm-test-001",
+        training=True,
     )
 
     assert rendered["num_nodes"] == 4
     assert rendered["resources"]["accelerators"] == "H200:8"
-    assert rendered["resources"]["infra"] == "k8s/Skypilot"
-    assert rendered["resources"]["disk_size"] == 100
+    assert "infra" not in rendered["resources"]
+    assert "disk_size" not in rendered["resources"]
+    assert rendered["resources"]["cpus"] == 160
+    assert rendered["resources"]["memory"] == 1840
     assert rendered["resources"]["job_recovery"]["strategy"] == "FAILOVER"
     assert "cloud" not in rendered["resources"]
     assert "file_mounts" not in rendered
     assert rendered["volumes"] == {
         "/mnt/jepawm-datasets": "jepawm-droid",
         "/mnt/jepawm-checkpoints": "jepawm-checkpoints",
+        "/checkpoints": "checkpoints",
     }
     assert rendered["envs"]["JEPAWM_STORAGE_BACKEND"] == "pvc"
     assert rendered["envs"]["DINOV3_WEIGHTS_SOURCE_PATH"].startswith(
         "/mnt/jepawm-checkpoints/artifacts/"
     )
+    assert rendered["envs"]["PANTHEON_USER"] == "kunvar@pantheon.inc"
+    assert rendered["envs"]["EXPERIMENT_TAG"] == "jepawm-test-001"
+    assert rendered["envs"]["WANDB_RUN_ID"] == "jepawm-test-001"
+    assert rendered["envs"]["WANDB_RESUME"] == "allow"
+    assert rendered["envs"]["NCCL_TOPO_FILE"].endswith("h200-141gb-sxm-ib-cloud-hypervisor.xml")
+    assert rendered["envs"]["PANTHEON_INFINIBAND_SOURCE"].startswith("modal-skypilot@")
+    pod_config = rendered["config"]["kubernetes"]["pod_config"]
+    assert pod_config["spec"]["containers"][0]["resources"]["requests"]["nvidia.com/hostdev"] == 8
     assert rendered["api_server_access"] is False
 
 
@@ -99,6 +112,7 @@ def test_cpu_only_profile_omits_disk_and_caps_library_threads():
     )
 
     assert "disk_size" not in rendered["resources"]
+    assert "/checkpoints" not in rendered["volumes"]
     assert {name: rendered["envs"][name] for name in (
         "OMP_NUM_THREADS",
         "MKL_NUM_THREADS",
@@ -114,3 +128,35 @@ def test_cpu_only_profile_omits_disk_and_caps_library_threads():
         "RAYON_NUM_THREADS": "16",
         "POLARS_MAX_THREADS": "16",
     }
+
+
+def test_training_identity_and_infiniband_are_fail_closed():
+    task = _base_task()
+    task["envs"]["NCCL_TOPO_FILE"] = "/tmp/incorrect.xml"
+    try:
+        render_k8s_task(
+            task,
+            droid_volume="jepawm-droid",
+            checkpoint_volume="jepawm-checkpoints",
+            context="Skypilot",
+            experiment_tag="jepawm-test-002",
+            training=True,
+        )
+    except ValueError as error:
+        assert "InfiniBand setting NCCL_TOPO_FILE" in str(error)
+    else:
+        raise AssertionError("An incompatible NCCL topology override was accepted")
+
+    try:
+        render_k8s_task(
+            _base_task(),
+            droid_volume="jepawm-droid",
+            checkpoint_volume="jepawm-checkpoints",
+            context="Skypilot",
+            experiment_tag="unsafe tag",
+            training=True,
+        )
+    except ValueError as error:
+        assert "filesystem-safe" in str(error)
+    else:
+        raise AssertionError("An unsafe experiment tag was accepted")

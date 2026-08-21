@@ -117,6 +117,7 @@ case "$mode" in
   distributed-smoke)
     task_spec=infra/skypilot/distributed_smoke.yaml
     [[ -n "$checkpoint_volume" ]] || { echo "--checkpoint-volume is required" >&2; exit 2; }
+    [[ -n "$run_id" ]] || { echo "distributed-smoke requires --run-id" >&2; exit 2; }
     ;;
   qualify|train-smoke|full)
     case "$mode" in
@@ -126,6 +127,7 @@ case "$mode" in
     esac
     [[ -n "$droid_volume" ]] || { echo "--droid-volume is required" >&2; exit 2; }
     [[ -n "$checkpoint_volume" ]] || { echo "--checkpoint-volume is required" >&2; exit 2; }
+    [[ -n "$run_id" ]] || { echo "$mode requires --run-id for EXPERIMENT_TAG/WANDB_RUN_ID" >&2; exit 2; }
     validate_dinov3_sha
     if [[ "$mode" == train-smoke && -z "$distributed_smoke_run_id" ]]; then
       echo "train-smoke requires --distributed-smoke-run-id from the completed cross-node smoke" >&2
@@ -159,6 +161,10 @@ trap 'rm -f "$rendered_task"' EXIT
 render_args=(--input "$task_spec" --output "$rendered_task" --context "$k8s_context")
 [[ -z "$droid_volume" ]] || render_args+=(--droid-volume "$droid_volume")
 [[ -z "$checkpoint_volume" ]] || render_args+=(--checkpoint-volume "$checkpoint_volume")
+[[ -z "$run_id" ]] || render_args+=(--experiment-tag "$run_id")
+if [[ "$mode" == train-smoke || "$mode" == full ]]; then
+  render_args+=(--training)
+fi
 "$python_for_sky" infra/skypilot/render_k8s_task.py "${render_args[@]}"
 "$python_for_sky" - "$rendered_task" <<'PY'
 import sys
@@ -166,6 +172,15 @@ import sky
 
 sky.Task.from_yaml(sys.argv[1])
 PY
+
+if [[ "$mode" == train-smoke || "$mode" == full ]]; then
+  pantheon_linter="${PANTHEON_GPU_LINTER:-$HOME/.codex/skills/run-pantheon-gpu-jobs/scripts/lint_gpu_job.py}"
+  [[ -f "$pantheon_linter" ]] || {
+    echo "Pantheon GPU linter is required: set PANTHEON_GPU_LINTER to lint_gpu_job.py" >&2
+    exit 2
+  }
+  uv run --no-project "$pantheon_linter" --training "$rendered_task"
+fi
 
 if ((dry_run)); then
   echo "Kubernetes profile for '$mode' rendered and passed Sky schema validation; no job was submitted."

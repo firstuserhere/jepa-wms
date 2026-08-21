@@ -63,10 +63,19 @@ run: |
   export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
   export JEPAWM_HOME="$PWD"
   export JEPAWM_DSET=/mnt/jepawm-datasets
-  export JEPAWM_LOGS=/mnt/jepawm-checkpoints/runs
-  export JEPAWM_CKPT=/mnt/jepawm-checkpoints/checkpoints
+  : "${PANTHEON_USER:?PANTHEON_USER is required}"
+  : "${EXPERIMENT_TAG:?EXPERIMENT_TAG is required}"
+  : "${JEPAWM_PANTHEON_ROOT:?JEPAWM_PANTHEON_ROOT is required}"
+  export JEPAWM_LOGS="$JEPAWM_PANTHEON_ROOT/runs"
+  export JEPAWM_CKPT="$JEPAWM_PANTHEON_ROOT/checkpoints"
   export JEPAWM_OSSCKPT="$PWD/.artifacts"
-  export JEPAWM_RUN_ID="${JEPAWM_RUN_ID:-${SKYPILOT_TASK_ID:?SKYPILOT_TASK_ID is required}}"
+  export JEPAWM_RUN_ID="${JEPAWM_RUN_ID:-$EXPERIMENT_TAG}"
+  [[ "$JEPAWM_RUN_ID" == "$EXPERIMENT_TAG" ]] || {
+    echo "JEPAWM_RUN_ID must equal EXPERIMENT_TAG for W&B/checkpoint continuity" >&2
+    exit 2
+  }
+  mkdir -p "$JEPAWM_LOGS" "$JEPAWM_CKPT"
+  chmod 777 "$JEPAWM_PANTHEON_ROOT" "$JEPAWM_LOGS" "$JEPAWM_CKPT"
   if [[ ! "$JEPAWM_RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then
     echo "JEPAWM_RUN_ID is not filesystem-safe" >&2
     exit 2

@@ -155,3 +155,12 @@ durable registry retains pending work; result publication and role promotion
 are atomic and checksum-bound. `resume` requires mathematical identity. `fork`
 strictly loads model weights but resets optimizer, schedulers, progress, RNG,
 sampler, and W&B while recording complete parent lineage.
+
+Recovery objects are published only at completed epoch boundaries and before
+rollout or planning evaluation. Each boundary records slowest-rank epoch time,
+checkpoint-write time, and the 300-second loss budget; runtime qualification
+must observe compliant boundaries on both sides of managed recovery. Rank-zero
+W&B telemetry uses one stable experiment ID and a ten-second `training-v1`
+heartbeat. Effective MFU is cumulative useful model forward/backward FLOPs over
+contiguous slowest-rank allocation wall time, so data, optimizer, collectives,
+validation, logging, and checkpoint overhead remain visible in the denominator.

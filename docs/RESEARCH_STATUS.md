@@ -1,6 +1,6 @@
 # Research status
 
-Last audited: 2026-08-19 (America/Los_Angeles).
+Last audited: 2026-08-21 (America/Los_Angeles).
 
 ## Executive state
 
@@ -14,6 +14,13 @@ There is no active JEPA-WM GPU job. No matched DROID training run has started.
 There is no combined `QUALIFIED.json` and no real-gradient
 `RUNTIME_READY.json`; therefore a full training launch is not yet unlocked by
 the repository's own gates.
+
+The local `codex/pantheon-training-readiness` worktree now renders the full
+Pantheon task with zero linter errors, current shim-generated InfiniBand,
+canonical checkpoint storage, stable W&B identity, continuous `training-v1`
+heartbeat, cumulative effective MFU, and measured epoch-boundary recovery.
+Those are implementation/test results only until this branch is reviewed,
+committed, pushed to an immutable SHA, and exercised on H200s.
 
 ## Git state
 
@@ -34,7 +41,8 @@ the latest check:
 | Volume | Size | Mode | Purpose |
 |---|---:|---|---|
 | `firstuserhere-jepawm-droid` | 8192 GiB | RWX PVC | Staged DROID and Franka validation data |
-| `firstuserhere-jepawm-checkpoints` | 2048 GiB | RWX PVC | DINO/released artifacts, checkpoints, receipts, logs |
+| `firstuserhere-jepawm-checkpoints` | 2048 GiB | RWX PVC | Immutable DINO/released model artifacts |
+| `checkpoints` | shared Pantheon volume | RWX | Per-user/per-experiment checkpoints, receipts, logs, W&B metadata |
 
 The DROID volume should be mounted read-only by training jobs. Do not reuse
 another researcher's volume.
@@ -108,24 +116,22 @@ the combined receipt were not completed.
 | Real DROID gradient/save/resume is exact | Not proven | Training smoke never run; no `RUNTIME_READY.json` |
 | Current checkpoint retention works on target PVC | Not runtime-proven | Unit-tested only; needs four-save/promotion observation |
 | Matched 94,500-update DROID training works | Not proven | Full run never launched |
-| Dashboard shows trustworthy live MFU | Not proven | Current code logs a selected-step MFU only; no `training-v1` heartbeat |
+| Dashboard shows trustworthy live MFU | Implemented, not runtime-proven | Static snapshot validator passes; needs live W&B/H200 evidence |
+| Pantheon full task passes current linter | Proven locally | 0 errors; sole static warning requires a live training-v1 audit |
 | Continued pretraining across datasets works at scale | Not proven | Fork mode implemented/unit-tested, not exercised after baseline |
 
 ## Required next sequence
 
-1. Update the Kubernetes renderer/tasks to the current Pantheon contract and
-   validate the exact rendered YAML.
-2. Implement and test continuous `training-v1` W&B heartbeat plus end-to-end
-   effective MFU, while retaining detailed one-step profiler diagnostics.
-3. Re-run released qualification from a new immutable SHA and finish all suites
+1. Review, commit, and push the Pantheon-readiness branch to a new immutable SHA.
+2. Re-run released qualification from that SHA and finish all suites
    plus `QUALIFIED.json`.
-4. Run the real two-node DROID gradient/save/restart/resume smoke and publish
+3. Run the real two-node DROID gradient/save/restart/resume smoke and publish
    `RUNTIME_READY.json`.
-5. Launch the matched 4 x 8 H200, 94,500-update baseline only after both receipts
+4. Launch the matched 4 x 8 H200, 94,500-update baseline only after both receipts
    pass fail-closed verification.
-6. Compare fixed rollout, planning, throughput, MFU, and checkpoint evidence to
+5. Compare fixed rollout, planning, throughput, MFU, and checkpoint evidence to
    the released baseline.
-7. Begin continuous pretraining as an explicit forked stage with new data,
+6. Begin continuous pretraining as an explicit forked stage with new data,
    optimizer state, W&B run, and lineage.
 
 Every launch requires fresh explicit user authorization, including the priority.

@@ -72,7 +72,8 @@ authoritative local history.
 | `src/utils/planning_promotion.py` | Planning registry, metrics, and role promotion |
 | `src/utils/qualification.py` | Released-baseline qualification receipts |
 | `src/utils/runtime_readiness.py` | Training/recovery readiness receipt |
-| `src/utils/mfu.py` | Current one-step FLOP/MFU calculation utility |
+| `src/utils/mfu.py` | One-step FLOP/MFU diagnostic utility |
+| `src/utils/training_telemetry.py` | Cumulative end-to-end MFU, W&B heartbeat, and training-v1 evidence |
 | `tests/` | Unit and infrastructure contract tests |
 
 ## Local setup

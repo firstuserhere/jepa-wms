@@ -144,20 +144,22 @@ def test_released_rollout_is_one_shot_full_corpus_no_gradient_qualification():
     }
 
 
-@pytest.mark.parametrize(
-    "overlay",
-    [
-        "released_planning_overlay.yaml",
-        "droid_dinov3_quality_overlay.yaml",
-    ],
-)
-def test_droid_planning_preserves_released_eight_rank_topology(overlay: str):
-    resolved = load_config(REPO_ROOT / "infra/skypilot" / overlay)
+def test_droid_planning_preserves_released_eight_rank_topology():
+    resolved = load_config(REPO_ROOT / "infra/skypilot/released_planning_overlay.yaml")
 
     assert resolved["evals"]["separate"] is False
     assert resolved["evals"]["inprocess_world_size"] == 8
     assert resolved["evals"]["nodes"] == 1
     assert resolved["evals"]["eval_episodes"] == 64
+
+
+def test_quality_training_keeps_planning_outside_the_gpu_allocation():
+    resolved = load_config(REPO_ROOT / "infra/skypilot/droid_dinov3_quality_overlay.yaml")
+
+    assert resolved["evals"]["eval_cfg_paths"] == []
+    assert resolved["checkpointing"]["epoch_boundary_only"] is True
+    assert resolved["checkpointing"]["save_every_epochs"] == 1
+    assert resolved["checkpointing"]["max_epoch_boundary_seconds"] == 300
 
 
 def test_full_task_requires_verified_released_qualification_before_torchrun():

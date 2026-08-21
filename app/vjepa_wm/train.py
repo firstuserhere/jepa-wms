@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import tempfile
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
@@ -80,6 +81,14 @@ from src.utils.dataset_manifest import (
 )
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
 from src.utils.mfu import training_performance_stats
+from src.utils.training_telemetry import (
+    EffectiveMFUAccumulator,
+    MFU_FORMULA_ID,
+    MFU_FORMULA_VERSION,
+    PantheonWandbHeartbeat,
+    telemetry_provenance,
+    telemetry_snapshot_document,
+)
 from src.utils.planning_promotion import (
     drain_planning_evaluations,
     load_planning_evaluation_registry,
@@ -143,6 +152,16 @@ def main(args, resume_preempt=False):
     checkpoint_keep_recent = int(cfgs_checkpointing.get("keep_recent", 0))
     if checkpoint_keep_recent < 0:
         raise ValueError("checkpointing.keep_recent must be non-negative")
+    checkpoint_epoch_boundary_only = bool(cfgs_checkpointing.get("epoch_boundary_only", True))
+    checkpoint_loss_budget_seconds = float(cfgs_checkpointing.get("max_epoch_boundary_seconds", 300.0))
+    if not checkpoint_epoch_boundary_only:
+        raise ValueError("JEPA-WM continuation checkpoints are supported only at completed epoch boundaries")
+    if checkpoint_loss_budget_seconds <= 0:
+        raise ValueError("checkpointing.max_epoch_boundary_seconds must be positive")
+    if checkpointing_enabled and checkpoint_save_every != 1:
+        raise ValueError(
+            "Pantheon-safe epoch-boundary recovery requires checkpointing.save_every_epochs=1"
+        )
     # -- META
     cfgs_meta = args.get("meta")
     load_model = cfgs_meta.get("load_checkpoint") or resume_preempt
@@ -362,11 +381,15 @@ def main(args, resume_preempt=False):
     mfu_peak_dense_tflops = float(cfgs_mfu.get("peak_dense_tflops", 0.0))
     mfu_measure_epoch = int(cfgs_mfu.get("measure_epoch", 0))
     mfu_measure_iteration = int(cfgs_mfu.get("measure_iteration", 2))
+    mfu_telemetry_interval_steps = int(cfgs_mfu.get("telemetry_interval_steps", 1))
+    mfu_heartbeat_interval_seconds = float(cfgs_mfu.get("heartbeat_interval_seconds", 10.0))
     if mfu_enabled:
         if mfu_peak_dense_tflops <= 0:
             raise ValueError("logging.mfu.peak_dense_tflops must be positive when MFU is enabled")
         if mfu_measure_epoch < 0 or mfu_measure_iteration < 0:
             raise ValueError("logging.mfu measurement coordinates must be non-negative")
+        if mfu_telemetry_interval_steps <= 0 or mfu_heartbeat_interval_seconds <= 0:
+            raise ValueError("MFU telemetry and heartbeat intervals must be positive")
 
     if light_eval_only_mode:
         light_eval_freq = 1
@@ -605,20 +628,31 @@ def main(args, resume_preempt=False):
                     "WANDB_MODE", ""
                 ).lower() != "offline":
                     raise RuntimeError("W&B is required, but WANDB_API_KEY is not present in the environment")
-                project_name = (
+                configured_project = (
                     config.get("project", "vjepa_wm")
                     if not config.get("debug", False)
                     else config.get("debug_project", "vjepa_wm_debug")
                 )
+                project_name = os.environ.get("WANDB_PROJECT", "").strip() or configured_project
                 run_metadata_dir = os.path.join(checkpoint_folder, "run_metadata")
                 os.makedirs(run_metadata_dir, exist_ok=True)
                 wandb_run_id_file = os.path.join(run_metadata_dir, "wandb_run_id.txt")
+                expected_wandb_run_id = os.environ.get("WANDB_RUN_ID", "").strip() or None
+                requested_resume_mode = os.environ.get("WANDB_RESUME", "allow").strip().lower()
+                if self.wandb_required and requested_resume_mode != "allow":
+                    raise RuntimeError(
+                        "Pantheon training requires WANDB_RESUME=allow for stable recovery continuity"
+                    )
                 if os.path.exists(wandb_run_id_file):
                     with open(wandb_run_id_file, "r") as f:
                         wandb_run_id = f.read().strip()
                     if not wandb_run_id:
                         raise RuntimeError(f"Empty W&B run ID file: {wandb_run_id_file}")
-                    resume_mode = "must"
+                    if expected_wandb_run_id and wandb_run_id != expected_wandb_run_id:
+                        raise RuntimeError(
+                            f"W&B run ID sidecar {wandb_run_id!r} does not match "
+                            f"WANDB_RUN_ID={expected_wandb_run_id!r}"
+                        )
                 else:
                     latest_alias = (
                         checkpoint_manager.read_alias("latest", verify=False)
@@ -632,27 +666,30 @@ def main(args, resume_preempt=False):
                     )
                     if alias_wandb_id:
                         wandb_run_id = str(alias_wandb_id)
-                        resume_mode = "must"
+                        if expected_wandb_run_id and wandb_run_id != expected_wandb_run_id:
+                            raise RuntimeError(
+                                f"Checkpoint W&B identity {wandb_run_id!r} does not match "
+                                f"WANDB_RUN_ID={expected_wandb_run_id!r}"
+                            )
                     elif latest_alias is not None:
                         raise RuntimeError(
                             "A latest checkpoint exists but its W&B identity sidecar is missing; "
                             "refusing to split an exact continuation across runs"
                         )
                     else:
-                        wandb_run_id = generate_wandb_run_id()
-                        resume_mode = "never"
+                        wandb_run_id = expected_wandb_run_id or generate_wandb_run_id()
                 wandb.init(
                     project=project_name,
                     entity=config.get("entity"),
                     group=config.get("group"),
                     tags=config.get("tags"),
                     id=wandb_run_id,
-                    resume=resume_mode,
+                    resume="allow",
                     dir=folder,
                     config=convert_to_dict_recursive(args),
                 )
                 self.wandb_run_id = wandb_run_id
-                if resume_mode == "must":
+                if os.path.exists(wandb_run_id_file):
                     logger.info(f"Resuming Wandb run {wandb_run_id}")
                 else:
                     descriptor, temporary_path = tempfile.mkstemp(
@@ -663,9 +700,11 @@ def main(args, resume_preempt=False):
                         stream.flush()
                         os.fsync(stream.fileno())
                     os.replace(temporary_path, wandb_run_id_file)
+                if self.wandb_required_online and not getattr(wandb.run, "url", None):
+                    raise RuntimeError("W&B online initialization returned no canonical run URL")
                 wandb.run.name = os.path.basename(folder)
-                wandb.define_metric("global_step")
-                wandb.define_metric("*", step_metric="global_step")
+                wandb.define_metric("train/global_step")
+                wandb.define_metric("*", step_metric="train/global_step")
                 self.job_set = set()
 
         def log(
@@ -682,12 +721,14 @@ def main(args, resume_preempt=False):
             log_dict = {
                 "epoch": epoch + 1,
                 "itr": itr,
-                "global_step": epoch * self.ipe + itr + 1 if global_step is None else global_step,
+                "train/global_step": epoch * self.ipe + itr + 1 if global_step is None else global_step,
             }
             for key, value in losses.items():
                 if isinstance(value, torch.Tensor):
                     value = value.detach().cpu().item()
                 log_dict[key] = value
+            if "loss" in log_dict:
+                log_dict["train/loss"] = float(log_dict["loss"])
             for key, value in total_stats.items():
                 log_dict[key] = value
             if eval_losses is not None:
@@ -695,6 +736,14 @@ def main(args, resume_preempt=False):
                     if isinstance(value, torch.Tensor):
                         value = value.detach().cpu().item()
                     log_dict[key] = value
+                validation_loss_keys = sorted(
+                    key for key in eval_losses if key == "loss" or key.endswith("/loss")
+                )
+                if validation_loss_keys:
+                    value = eval_losses[validation_loss_keys[0]]
+                    if isinstance(value, torch.Tensor):
+                        value = value.detach().cpu().item()
+                    log_dict["val/loss"] = float(value)
             if eval_total_stats is not None:
                 for key, value in eval_total_stats.items():
                     log_dict[key] = value
@@ -706,7 +755,7 @@ def main(args, resume_preempt=False):
             if "loss" in log_dict.keys() and itr % log_freq == 0:
                 logger.info("[%d, %5d] " "loss: %.3f | " % (epoch + 1, itr, log_dict["loss"]))
             if self.use_wandb and rank == 0:
-                wandb.log(log_dict, step=log_dict["global_step"])
+                wandb.log(log_dict, step=log_dict["train/global_step"])
                 if "perf/mfu_dense" in log_dict:
                     current_mfu = float(log_dict["perf/mfu_dense"])
                     wandb.run.summary["perf/mfu_dense_last"] = current_mfu
@@ -1458,7 +1507,54 @@ def main(args, resume_preempt=False):
     # -- TRAINING LOOP
     if not (plan_only_eval_mode or unroll_decode_eval_only_mode):
         measured_training_flops_per_sample = None
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        training_wall_started = time.monotonic()
+        mfu_accumulator = None
+        pantheon_heartbeat = None
+        latest_mfu_snapshot = None
+        telemetry_provenance_record = None
+        validation_has_started = False
+        if mfu_enabled and not light_eval_only_mode:
+            mfu_accumulator = EffectiveMFUAccumulator(
+                total_steps=ipe * num_epochs,
+                gpu_count=world_size,
+                peak_flops_per_gpu=mfu_peak_dense_tflops * 1e12,
+                started_at=training_wall_started,
+            )
+            if rank == 0 and trainer.use_wandb:
+                git_commit = os.environ.get("GIT_COMMIT_HASH", "")
+                if not re.fullmatch(r"[0-9a-f]{40}", git_commit):
+                    raise RuntimeError("training-v1 telemetry requires immutable GIT_COMMIT_HASH")
+                provenance = telemetry_provenance(
+                    git_commit=git_commit,
+                    world_size=world_size,
+                    peak_flops_per_gpu=mfu_peak_dense_tflops * 1e12,
+                    timed_wall_coverage=1.0,
+                )
+                telemetry_provenance_record = dict(provenance)
+                wandb.config.update(
+                    {
+                        "pantheon_telemetry": {
+                            **provenance,
+                            "formula_id": MFU_FORMULA_ID,
+                            "formula_version": MFU_FORMULA_VERSION,
+                            "global_batch": int(cfgs_loader.get("batch_size")) * world_size,
+                            "gradient_accumulation": 1,
+                            "experiment_tag": os.environ.get("EXPERIMENT_TAG"),
+                            "wandb_run_id": trainer.wandb_run_id,
+                        }
+                    },
+                    allow_val_change=False,
+                )
+                pantheon_heartbeat = PantheonWandbHeartbeat(
+                    wandb.run,
+                    total_steps=ipe * num_epochs,
+                    interval_seconds=mfu_heartbeat_interval_seconds,
+                )
+                pantheon_heartbeat.start()
         for epoch in range(start_epoch, num_epochs):
+            epoch_wall_started = time.monotonic()
             logger.info("\n" + "─" * 50)
             logger.info(f"📈 Epoch {epoch + 1}/{num_epochs}")
             logger.info("─" * 50)
@@ -1477,7 +1573,8 @@ def main(args, resume_preempt=False):
             wall_time_meter = AverageMeter()
 
             for itr in range(ipe):
-                itr_start_time = time.time()
+                itr_start_time = time.monotonic()
+                flop_measurement = {"counter": None, "before_transition_optimizer": None}
                 if quick_debug or light_eval_only_mode:
                     if itr > 5:
                         break
@@ -1731,6 +1828,13 @@ def main(args, resume_preempt=False):
                                 grad_stats[name], optim_stats[name] = world_model.heads[name].optimization_step()
                         if train_predictor:
                             world_model.backward(total_transition_loss)
+                            if flop_measurement["counter"] is not None:
+                                # The useful-work numerator includes the frozen
+                                # encoder forward and trainable predictor
+                                # forward/backward, but excludes optimizer math.
+                                flop_measurement["before_transition_optimizer"] = float(
+                                    flop_measurement["counter"].get_total_flops()
+                                )
                             grad_stats["transition_model"], optim_stats["transition_model"] = (
                                 world_model.optimization_step()
                             )
@@ -1978,10 +2082,13 @@ def main(args, resume_preempt=False):
                         from torch.utils.flop_counter import FlopCounterMode
 
                         with FlopCounterMode(display=False) as flop_counter:
+                            flop_measurement["counter"] = flop_counter
                             (loss, losses, optim_stats, total_stats, image_stats), gpu_etime_ms = gpu_timer(
                                 lambda: step_model(obs, action, state, reward, train=True)
                             )
-                        measured_step_flops = float(flop_counter.get_total_flops())
+                        measured_step_flops = flop_measurement["before_transition_optimizer"]
+                        if measured_step_flops is None:
+                            measured_step_flops = float(flop_counter.get_total_flops())
                         measured_batch_size = int(obs["visual"].shape[0])
                         if measured_step_flops <= 0 or measured_batch_size <= 0:
                             raise RuntimeError(
@@ -1996,7 +2103,7 @@ def main(args, resume_preempt=False):
                         (loss, losses, optim_stats, total_stats, image_stats), gpu_etime_ms = gpu_timer(
                             lambda: step_model(obs, action, state, reward, train=True)
                         )
-                    iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
+                    iter_elapsed_time_ms = (time.monotonic() - itr_start_time) * 1000.0
                     if measured_training_flops_per_sample is not None:
                         total_stats.update(
                             training_performance_stats(
@@ -2008,6 +2115,10 @@ def main(args, resume_preempt=False):
                                 peak_dense_tflops=mfu_peak_dense_tflops,
                             )
                         )
+                    if mfu_accumulator is not None:
+                        mfu_accumulator.record_samples(int(obs["visual"].shape[0]) * world_size)
+                        if measured_training_flops_per_sample is not None:
+                            mfu_accumulator.set_flops_per_sample(measured_training_flops_per_sample)
                     loss_meter.update(loss)
                     gpu_time_meter.update(gpu_etime_ms)
                     wall_time_meter.update(iter_elapsed_time_ms)
@@ -2018,6 +2129,7 @@ def main(args, resume_preempt=False):
                     total_stats = {}
 
                 if itr % light_eval_freq == light_eval_freq - 1 and val_loader_iters is not None:
+                    validation_has_started = True
                     # image_stats overrides the empty image_stats from the train step at same itr
                     image_stats, eval_losses, eval_total_stats = {}, {}, {}
                     # Then, use non-distributed validation data for visualization on rank 0
@@ -2060,6 +2172,28 @@ def main(args, resume_preempt=False):
                 else:
                     eval_losses = {}
                     eval_total_stats = {}
+
+                if mfu_accumulator is not None and (
+                    (itr + 1) % mfu_telemetry_interval_steps == 0 or (epoch == num_epochs - 1 and itr == ipe - 1)
+                ):
+                    local_step_time_s = max(1e-9, time.monotonic() - itr_start_time)
+                    local_elapsed_e2e_s = max(1e-9, time.monotonic() - training_wall_started)
+                    timing = torch.tensor(
+                        [local_step_time_s, local_elapsed_e2e_s],
+                        dtype=torch.float64,
+                        device=device,
+                    )
+                    if torch.distributed.is_available() and torch.distributed.is_initialized():
+                        torch.distributed.all_reduce(timing, op=torch.distributed.ReduceOp.MAX)
+                    latest_mfu_snapshot = mfu_accumulator.snapshot(
+                        active_step=epoch * ipe + itr + 1,
+                        step_time_s=float(timing[0].item()),
+                        elapsed_e2e_s=float(timing[1].item()),
+                        timed_wall_coverage=1.0,
+                    )
+                    total_stats.update(latest_mfu_snapshot.history())
+                    if rank == 0 and pantheon_heartbeat is not None:
+                        pantheon_heartbeat.update(latest_mfu_snapshot)
 
                 # -- Logging
                 def log_stats():
@@ -2107,8 +2241,117 @@ def main(args, resume_preempt=False):
                     assert not np.isnan(loss), "loss is nan"
             logger.info("avg. loss %.3f" % loss_meter.avg)
 
-            # -- Deterministic held-out rollout promotion
+            # Publish recovery state immediately at the completed epoch boundary.
+            # Rollout/planning evaluation happens only after this durable point, so
+            # expensive evaluation can never extend the useful-work loss window.
             promotion_metrics = {}
+            planning_due = bool(cfgs_plan_evals and cfgs_plan_evals.get("eval_cfg_paths")) and (
+                (epoch % eval_freq == 0) or epoch == (num_epochs - 1)
+            )
+            saved_reference = None
+            checkpoint_time_s = 0.0
+            epoch_boundary_time_s = 0.0
+            if not light_eval_only_mode and (
+                (epoch + 1) % checkpoint_save_every == 0 or epoch == (num_epochs - 1)
+            ):
+                checkpoint_started = time.monotonic()
+                saved_reference = save_checkpoint(
+                    epoch + 1,
+                    latest_path,
+                    promotion_metrics=None,
+                    pending_planning=planning_due,
+                )
+                timing = torch.tensor(
+                    [
+                        max(1e-9, time.monotonic() - checkpoint_started),
+                        max(1e-9, time.monotonic() - epoch_wall_started),
+                        max(1e-9, time.monotonic() - training_wall_started),
+                    ],
+                    dtype=torch.float64,
+                    device=device,
+                )
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(timing, op=torch.distributed.ReduceOp.MAX)
+                checkpoint_time_s = float(timing[0].item())
+                epoch_boundary_time_s = float(timing[1].item())
+                within_loss_budget = epoch_boundary_time_s <= checkpoint_loss_budget_seconds
+                if rank == 0:
+                    timing_path = os.path.join(
+                        checkpoint_folder, "run_metadata", "epoch_boundary_timing.json"
+                    )
+                    previous_max = 0.0
+                    if os.path.exists(timing_path):
+                        with open(timing_path, "r", encoding="utf-8") as stream:
+                            previous_max = float(json.load(stream).get("max_epoch_boundary_seconds", 0.0))
+                    atomic_json_dump(
+                        {
+                            "schema_version": 1,
+                            "kind": "jepa-wm-epoch-boundary-checkpoint-timing",
+                            "epoch_boundary_only": True,
+                            "epoch": epoch + 1,
+                            "global_update": (epoch + 1) * ipe,
+                            "checkpoint_seconds": checkpoint_time_s,
+                            "epoch_boundary_seconds": epoch_boundary_time_s,
+                            "max_epoch_boundary_seconds": max(previous_max, epoch_boundary_time_s),
+                            "loss_budget_seconds": checkpoint_loss_budget_seconds,
+                            "within_loss_budget": within_loss_budget,
+                        },
+                        timing_path,
+                    )
+                    if trainer.use_wandb:
+                        wandb.log(
+                            {
+                                "train/global_step": (epoch + 1) * ipe,
+                                "perf/checkpoint_time_s": checkpoint_time_s,
+                                "perf/epoch_boundary_interval_s": epoch_boundary_time_s,
+                                "perf/checkpoint_loss_budget_s": checkpoint_loss_budget_seconds,
+                            },
+                            step=(epoch + 1) * ipe,
+                        )
+                    if (
+                        mfu_accumulator is not None
+                        and latest_mfu_snapshot is not None
+                        and telemetry_provenance_record is not None
+                        and trainer.use_wandb
+                    ):
+                        latest_mfu_snapshot = mfu_accumulator.snapshot(
+                            active_step=(epoch + 1) * ipe,
+                            step_time_s=latest_mfu_snapshot.step_time_s,
+                            elapsed_e2e_s=float(timing[2].item()),
+                            timed_wall_coverage=1.0,
+                        )
+                        if pantheon_heartbeat is not None:
+                            pantheon_heartbeat.update(latest_mfu_snapshot)
+                        telemetry_document = telemetry_snapshot_document(
+                            latest_mfu_snapshot,
+                            wandb_url=wandb.run.url,
+                            provenance=telemetry_provenance_record,
+                            validation_started=validation_has_started,
+                        )
+                        telemetry_directory = os.path.join(checkpoint_folder, "run_metadata")
+                        atomic_json_dump(
+                            telemetry_document,
+                            os.path.join(
+                                telemetry_directory,
+                                f"training_v1_step-{(epoch + 1) * ipe:012d}.json",
+                            ),
+                        )
+                        atomic_json_dump(
+                            telemetry_document,
+                            os.path.join(telemetry_directory, "training_v1_snapshot.json"),
+                        )
+                if not within_loss_budget:
+                    raise RuntimeError(
+                        f"Epoch {epoch + 1} plus checkpoint took {epoch_boundary_time_s:.1f}s, "
+                        f"exceeding the {checkpoint_loss_budget_seconds:.1f}s Pantheon work-loss budget"
+                    )
+                if checkpoint_manager is None and rank == 0:
+                    if save_every_freq > 0 and epoch % save_every_freq == 0:
+                        save_every_file = pref_tag + f"e{epoch}.{latest_format}"
+                        save_every_path = os.path.join(checkpoint_folder, save_every_file)
+                        save_checkpoint(epoch + 1, save_every_path)
+
+            # -- Deterministic held-out rollout promotion
             rollout_promotion_cfg = cfgs_checkpointing.get("rollout_promotion", {})
             rollout_promotion_due = (
                 checkpointing_enabled
@@ -2192,6 +2435,33 @@ def main(args, resume_preempt=False):
                     "seed": int(rollout_promotion_cfg.get("seed", seed + 50_000 + loader_index)),
                 }
 
+                if not rollout_only_eval_mode:
+                    if checkpoint_manager is None or saved_reference is None:
+                        raise RuntimeError(
+                            "Rollout promotion requires the immutable epoch-boundary checkpoint"
+                        )
+
+                    def promote_saved_rollout_checkpoint():
+                        metric = promotion_metrics["best_rollout"]
+                        return checkpoint_manager.promote(
+                            "best_rollout",
+                            saved_reference,
+                            metric_name=metric["metric_name"],
+                            metric_value=metric["metric_value"],
+                            mode=metric["mode"],
+                            metrics=metric,
+                            tie_break="older",
+                        )
+
+                    rollout_promoted = _run_rank0_planning_controller(
+                        rank,
+                        promote_saved_rollout_checkpoint,
+                        "best-rollout checkpoint promotion",
+                    )
+                    if rank == 0 and trainer.use_wandb and rollout_promoted:
+                        wandb.run.summary["best_rollout/checkpoint_id"] = saved_reference["object_id"]
+                        wandb.run.summary["best_rollout/value"] = primary_value
+
                 if rollout_only_eval_mode:
                     if load_path is None:
                         raise RuntimeError("rollout-only qualification requires a loaded checkpoint")
@@ -2264,33 +2534,13 @@ def main(args, resume_preempt=False):
                 if rank == 0 and trainer.use_wandb:
                     wandb.log(
                         {
-                            "global_step": (epoch + 1) * ipe,
+                            "train/global_step": (epoch + 1) * ipe,
                             "promotion/rollout/primary": primary_value,
                             "promotion/rollout/count": total_count,
                             **{f"promotion/rollout/{key}": value for key, value in horizon_metrics.items()},
                         },
                         step=(epoch + 1) * ipe,
                     )
-
-            planning_due = bool(cfgs_plan_evals and cfgs_plan_evals.get("eval_cfg_paths")) and (
-                (epoch % eval_freq == 0) or epoch == (num_epochs - 1)
-            )
-
-            # -- Save complete continuation state
-            saved_reference = None
-            if not light_eval_only_mode:
-                if (epoch + 1) % checkpoint_save_every == 0 or epoch == (num_epochs - 1):
-                    saved_reference = save_checkpoint(
-                        epoch + 1,
-                        latest_path,
-                        promotion_metrics=promotion_metrics,
-                        pending_planning=planning_due,
-                    )
-                    if checkpoint_manager is None and rank == 0:
-                        if save_every_freq > 0 and epoch % save_every_freq == 0:
-                            save_every_file = pref_tag + f"e{epoch}.{latest_format}"
-                            save_every_path = os.path.join(checkpoint_folder, save_every_file)
-                            save_checkpoint(epoch + 1, save_every_path)
 
             # -- Launch Planning Eval
             if not light_eval_only_mode:
@@ -2325,6 +2575,31 @@ def main(args, resume_preempt=False):
                         final_epoch=epoch == (num_epochs - 1),
                     )
                     world_model.train()
+        if mfu_accumulator is not None and latest_mfu_snapshot is not None:
+            final_timing = torch.tensor(
+                [latest_mfu_snapshot.step_time_s, max(1e-9, time.monotonic() - training_wall_started)],
+                dtype=torch.float64,
+                device=device,
+            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(final_timing, op=torch.distributed.ReduceOp.MAX)
+            latest_mfu_snapshot = mfu_accumulator.snapshot(
+                active_step=min(ipe * num_epochs, max(start_epoch * ipe, latest_mfu_snapshot.active_step)),
+                step_time_s=float(final_timing[0].item()),
+                elapsed_e2e_s=float(final_timing[1].item()),
+                timed_wall_coverage=1.0,
+            )
+            if rank == 0 and trainer.use_wandb:
+                if pantheon_heartbeat is not None:
+                    pantheon_heartbeat.update(latest_mfu_snapshot)
+                    pantheon_heartbeat.close()
+                wandb.log(
+                    {
+                        "train/global_step": latest_mfu_snapshot.active_step,
+                        **latest_mfu_snapshot.history(),
+                    },
+                    step=latest_mfu_snapshot.active_step,
+                )
     elif unroll_decode_eval_only_mode:
         logger.info("Launching unroll-decode evals only mode")
         checkpoint = pref_tag + f"latest.{latest_format}"
@@ -2728,7 +3003,7 @@ def launch_planning_evals(
                             }
                             wandb.log(
                                 {
-                                    "global_step": wandb_step,
+                                    "train/global_step": wandb_step,
                                     f"{metric_prefix}/complete": 1,
                                     **scalar_metrics,
                                 },

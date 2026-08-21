@@ -1,0 +1,41 @@
+# Generated from Pantheon-Industries-Inc/modal-skypilot at the immutable commit
+# below by importing modal_skypilot.mapping.NCCL_ENVS and
+# modal_skypilot.mapping.infiniband_pod_config(8).  Do not edit this artifact by
+# hand; refresh it from that shim and update the provenance together.
+source_repository: https://github.com/Pantheon-Industries-Inc/modal-skypilot.git
+source_commit: 32ce29872d49b728ede2f90427f543a4aa64bcea
+verified_on: "2026-08-09"
+verified_environment_variable: PANTHEON_INFINIBAND_VERIFIED
+envs:
+  PANTHEON_INFINIBAND_VERIFIED: "2026-08-09"
+  NCCL_TOPO_FILE: /opt/nccl_topo/h200-141gb-sxm-ib-cloud-hypervisor.xml
+  UCX_RNDV_SCHEME: get_zcopy
+  UCX_TLS: self,sm,cuda_copy
+  NCCL_IB_PCI_RELAXED_ORDERING: "1"
+  NCCL_IB_SPLIT_DATA_ON_QPS: "0"
+  NCCL_IB_QPS_PER_CONNECTION: "2"
+  NCCL_IB_MERGE_VFS: "0"
+  NCCL_IB_HCA: "^mlx5_0:1"
+  NCCL_NVLS_ENABLE: "1"
+  NCCL_IB_SL: "1"
+  NCCL_IBEXT_DISABLE: "1"
+pod_config:
+  spec:
+    volumes:
+      - name: nccl-topo
+        hostPath:
+          path: /etc/crusoe/nccl_topo
+          type: Directory
+    containers:
+      - securityContext:
+          capabilities:
+            add:
+              - IPC_LOCK
+        volumeMounts:
+          - mountPath: /opt/nccl_topo
+            name: nccl-topo
+        resources:
+          limits:
+            nvidia.com/hostdev: 8
+          requests:
+            nvidia.com/hostdev: 8

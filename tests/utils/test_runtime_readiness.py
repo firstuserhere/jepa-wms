@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("torch")
+
 from src.utils.checkpointing import (
     CheckpointManager,
     build_checkpoint_v2,
@@ -97,6 +99,68 @@ def _runtime_inputs(tmp_path: Path):
     reference = manager.save(checkpoint, epoch=2, global_update=16)
     manager.promote("latest", reference)
 
+    def write_telemetry(step: int) -> Path:
+        path = checkpoint_root / "run_metadata" / f"training_v1_step-{step:012d}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        elapsed = float(step)
+        peak = 989e12
+        useful = 0.25 * elapsed * 16 * peak
+        path.write_text(
+            json.dumps(
+                {
+                    "summary": {
+                        "pantheon_telemetry/contract_version": "training-v1",
+                        "pantheon_telemetry/heartbeat_at": 1_800_000_000.0,
+                        "pantheon_telemetry/total_steps": 16,
+                        "pantheon_telemetry/active_step": step,
+                        "pantheon_telemetry/step_time_s": 1.0,
+                        "pantheon_telemetry/effective_mfu": 0.25,
+                        "pantheon_telemetry/wandb_url": (
+                            "https://wandb.ai/entity/project/runs/training-wandb"
+                        ),
+                    },
+                    "history_keys": [
+                        "train/global_step",
+                        "train/loss",
+                        "val/loss",
+                        "perf/effective_mfu",
+                        "perf/model_flops",
+                        "perf/elapsed_e2e_s",
+                        "perf/gpu_count",
+                        "perf/peak_flops_per_gpu",
+                        "perf/timed_wall_coverage",
+                        "perf/actual_global_samples",
+                    ],
+                    "validation_started": True,
+                    "mfu_terms": {
+                        "elapsed_s": elapsed,
+                        "gpu_count": 16,
+                        "useful_flops_by_precision": {"bf16": useful},
+                        "peak_flops_per_gpu": {"bf16": peak},
+                    },
+                    "provenance": {
+                        "formula_id": "test",
+                        "formula_version": "1",
+                        "git_commit": source_commit,
+                        "gpu_sku": "NVIDIA H200",
+                        "gpu_form_factor": "SXM",
+                        "precision": "bf16",
+                        "sparsity": "dense",
+                        "peak_flops_per_gpu": peak,
+                        "peak_source": "test",
+                        "world_size": 16,
+                        "timing_scope": "end-to-end-slowest-rank",
+                        "timed_wall_coverage": 1.0,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    first_telemetry = write_telemetry(8)
+    final_telemetry = write_telemetry(16)
+
     common_snapshot = {
         "wandb_run_id": "training-wandb",
         "checkpoint_schema_version": 2,
@@ -105,6 +169,13 @@ def _runtime_inputs(tmp_path: Path):
         "encoder_repo_revision": DINOV3_REPOSITORY_REVISION,
         "encoder_weights_sha256": weights_sha,
         "resume_contract_sha256": manifest["resume_contract"]["sha256"],
+        "epoch_boundary_only": True,
+        "epoch_boundary_seconds": 120.0,
+        "checkpoint_seconds": 10.0,
+        "checkpoint_loss_budget_seconds": 300.0,
+        "checkpoint_within_loss_budget": True,
+        "telemetry_effective_mfu": 0.25,
+        "telemetry_wandb_url": "https://wandb.ai/entity/project/runs/training-wandb",
     }
     first = {
         **common_snapshot,
@@ -112,6 +183,8 @@ def _runtime_inputs(tmp_path: Path):
         "global_update": 8,
         "object_id": "first-checkpoint.pth.tar",
         "sha256": "f" * 64,
+        "telemetry_snapshot_path": str(first_telemetry),
+        "telemetry_snapshot_sha256": sha256_file(first_telemetry),
     }
     final = {
         **common_snapshot,
@@ -119,6 +192,8 @@ def _runtime_inputs(tmp_path: Path):
         "global_update": 16,
         "object_id": reference.object_id,
         "sha256": reference.sha256,
+        "telemetry_snapshot_path": str(final_telemetry),
+        "telemetry_snapshot_sha256": sha256_file(final_telemetry),
     }
     training_state = tmp_path / "training_recovery_smoke.json"
     _write_integrity(

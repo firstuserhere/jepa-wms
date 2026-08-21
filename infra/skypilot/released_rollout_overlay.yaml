@@ -10,6 +10,8 @@ overrides:
     strict_continuation: false
     require_dataset_manifest: true
     dataset_manifest_path: ${JEPAWM_DSET}/DROID/droid_manifest.json
+    rollout_promotion:
+      every_epochs: 1
   meta:
     plan_only_eval_mode: false
     light_eval_only_mode: true

@@ -15,6 +15,10 @@ overrides:
     require_git_manifest: true
     dataset_manifest_path: ${JEPAWM_DSET}/DROID/droid_manifest.json
     save_every_epochs: 1
+    epoch_boundary_only: true
+    # A runtime-readiness receipt must prove every full epoch plus atomic
+    # checkpoint publication stays inside Pantheon's five-minute loss budget.
+    max_epoch_boundary_seconds: 300
     # Independent crash-recovery fallbacks, in addition to semantic best roles.
     keep_recent: 3
     keep_pending_planning: true
@@ -23,7 +27,7 @@ overrides:
     # topology.  Never let training-time sampler progress select this slice.
     rollout_promotion:
       enabled: true
-      every_epochs: 1
+      every_epochs: 6
       loader_index: 0
       sampler_epoch: 0
       seed: 50234
@@ -41,13 +45,22 @@ overrides:
       enabled: true
       # NVIDIA quotes 1,979 BF16 TFLOPS for H200 SXM with sparsity;
       # dense peak is half that value. MFU must use the dense denominator.
-      peak_dense_tflops: 989.5
+      peak_dense_tflops: 989.0
       measure_epoch: 0
       measure_iteration: 2
+      telemetry_interval_steps: 1
+      heartbeat_interval_seconds: 10
     wandb:
       use_wandb: true
       required: true
       required_online: true
+      project: vjepa_wm
+      group: droid-dinov3-jepawm-baseline
+      tags: [droid, dinov3-vitl16, jepa-wm, pantheon-h200]
+      # The released config disables W&B media. Pantheon research runs keep
+      # both online media and durable local copies for a complete audit trail.
+      disable_wandb_media: false
+      log_media_locally: true
   model:
     visual_encoder:
       pretrain_enc_path: ${DINOV3_WEIGHTS_PATH}
@@ -55,11 +68,9 @@ overrides:
       pretrain_enc_repo_path: ${DINOV3_REPO_PATH}
       pretrain_enc_repo_revision: 54694f7627fd815f62a5dcc82944ffa6153bbb76
   evals:
-    # SkyPilot does not provide the Slurm/Submitit scheduler used upstream.
-    # Keep one canonical suite synchronous. Only ranks 0..7 participate in
-    # planning, exactly matching the released 1-node/8-rank seed topology;
-    # the remaining training ranks wait without entering planner collectives.
+    # Planning is a separate immutable-checkpoint job. Keeping it out of the
+    # 32-GPU training allocation prevents 24 ranks from waiting on the released
+    # eight-rank planner and keeps training MFU scientifically interpretable.
     separate: false
     inprocess_world_size: 8
-    eval_cfg_paths:
-      - configs/online_plan_evals/droid/droid_L2_cem_sourcedset_H3_nas3_maxnorm01_ctxt2_gH3.yaml
+    eval_cfg_paths: []

@@ -31,16 +31,19 @@ Priority is a scheduling policy, not a performance hyperparameter:
 ## Current Pantheon task contract
 
 Before the next launch, render and inspect the final task against the current
-cluster guide. As audited on 2026-08-19, a full H200 node should start from
+cluster guide. As audited on 2026-08-21, a full H200 node should start from
 `H200:8`, 160 CPUs, and 1840 GB memory unless a dated measurement justifies a
 smaller request. The final task must not retain provider `infra`, `disk_size`,
 or ephemeral-storage requests. Multi-node jobs must use the approved
 InfiniBand/network shim and prove the actual transport in a smoke.
 
-The repository's current `render_k8s_task.py` predates this contract: it adds
-`infra: k8s/Skypilot`, adds `disk_size: 100` to GPU workers, and existing tasks
-request 128 CPUs/1000 GB per full node. That worked for jobs 8448, 8451, and
-8529, but it is now a known pre-launch incompatibility, not a template to copy.
+The Pantheon renderer now removes `infra`, `disk_size`, provider selectors, and
+ephemeral-storage requests; emits 160 CPU/1840 GB for each H200:8 pod; mounts
+the shared volume exactly as `/checkpoints: checkpoints`; and injects the
+checked-in output generated from `modal-skypilot` commit
+`32ce29872d49b728ede2f90427f543a4aa64bcea`. The personal 2 TiB volume remains
+an immutable model-artifact store; new checkpoints, receipts, logs, and W&B
+metadata live under `/checkpoints/$PANTHEON_USER/$EXPERIMENT_TAG`.
 
 ## Mandatory W&B and MFU contract
 
@@ -53,16 +56,15 @@ ID across managed recovery. The dashboard contract is `training-v1`:
 - history containing `train/loss*` and validation loss when available;
 - stable step semantics across resume.
 
-MFU must cover the entire useful distributed training iteration: forward,
-backward, optimizer, required collectives, and unavoidable input stalls. Use the
-dense H200 BF16 peak denominator and a model-aware FLOP count. Log detailed
-compute-active diagnostics separately, but do not label them effective MFU.
-
-Current code profiles one selected real step with PyTorch's FLOP counter and
-logs `perf/mfu_dense`, `perf/mfu_dense_gpu_active`, throughput, duty cycle, and
-step timings. That is useful diagnostic instrumentation, but it is neither
-continuous nor the required `training-v1` heartbeat. Evaluation and planning
-must report throughput/utilization, never fabricated MFU.
+Effective MFU uses a representative real DROID operator profile sampled after
+model forward/backward and before the transition optimizer. It counts unique
+global model work once and divides the cumulative useful-FLOP sum by contiguous
+slowest-rank wall time, all allocated GPUs, and the dense H200 SXM BF16 peak of
+989 TFLOP/s. Input stalls, collectives, optimizer, logging, validation, and
+checkpoint time remain in the denominator. Rank zero refreshes the exact
+`training-v1` fields every ten seconds and writes a validator-compatible
+`run_metadata/training_v1_snapshot.json` at each checkpoint. The original
+compute-active metrics remain separately named diagnostics.
 
 ## Go/no-go ladder
 
@@ -101,8 +103,10 @@ task; a Codex conversation is not an operations controller.
 ## Checkpoint policy
 
 - Rank zero alone publishes shared checkpoint objects.
-- Save at least every epoch and ensure expected work loss remains under five
-  minutes for long jobs; if an epoch exceeds that, add update-based saves.
+- Save exactly at every completed epoch boundary. The trainer publishes before
+  rollout/planning evaluation, records the slowest-rank epoch-plus-checkpoint
+  duration, and fails if it exceeds 300 seconds. Runtime readiness rejects the
+  run unless both pre- and post-recovery boundaries meet that measured budget.
 - Keep atomic `latest`, semantic best roles, pending planning references, and
   three recent immutable fallbacks.
 - Verify checksum and close-to-open visibility from another node.
