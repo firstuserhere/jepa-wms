@@ -1,6 +1,6 @@
 # Research status
 
-Last audited: 2026-08-21 (America/Los_Angeles).
+Last audited: 2026-08-25 (America/Los_Angeles).
 
 ## Executive state
 
@@ -21,6 +21,13 @@ canonical checkpoint storage, stable W&B identity, continuous `training-v1`
 heartbeat, cumulative effective MFU, and measured epoch-boundary recovery.
 Those are implementation/test results only until this branch is reviewed,
 committed, pushed to an immutable SHA, and exercised on H200s.
+
+A bounded single-node MFU-box profile is now implemented for the exact matched
+DROID/DINOv3 training path: one 8xH200 node, the production per-GPU batch and
+loader settings, 96 real optimizer updates, two epoch-boundary checkpoints,
+five-second W&B system telemetry, worst-rank pipeline diagnostics, and an
+integrity-protected `MFU_BOX.json` decision record. This is not yet runtime
+evidence. The 32-GPU launch remains gated on two consistent successful boxes.
 
 ## Git state
 
@@ -117,6 +124,7 @@ the combined receipt were not completed.
 | Current checkpoint retention works on target PVC | Not runtime-proven | Unit-tested only; needs four-save/promotion observation |
 | Matched 94,500-update DROID training works | Not proven | Full run never launched |
 | Dashboard shows trustworthy live MFU | Implemented, not runtime-proven | Static snapshot validator passes; needs live W&B/H200 evidence |
+| Single-node training is efficient enough to scale | Not proven | Needs two successful 8xH200 `MFU_BOX.json` records plus W&B all-GPU review |
 | Pantheon full task passes current linter | Proven locally | 0 errors; sole static warning requires a live training-v1 audit |
 | Continued pretraining across datasets works at scale | Not proven | Fork mode implemented/unit-tested, not exercised after baseline |
 

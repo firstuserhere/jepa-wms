@@ -59,7 +59,7 @@ printf '%s\\n' "$@" > "$JEPAWM_TEST_SKY_LOG"
     arguments = invocation_log.read_text(encoding="utf-8").splitlines()
     assert arguments[:2] == ["jobs", "launch"]
     assert "--priority" in arguments
-    assert "p1" in arguments
+    assert "p3" in arguments
     assert "-y" in arguments
     assert "-d" in arguments
     assert "--env" not in arguments

@@ -6,6 +6,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 
@@ -241,6 +242,7 @@ def telemetry_snapshot_document(
     wandb_url: str,
     provenance: Mapping[str, Any],
     validation_started: bool,
+    diagnostics: Mapping[str, Any] | None = None,
     heartbeat_at: float | None = None,
 ) -> dict[str, Any]:
     """Build the validator-compatible durable telemetry evidence document."""
@@ -259,7 +261,9 @@ def telemetry_snapshot_document(
     ]
     if validation_started:
         history_keys.append("val/loss")
-    return {
+    if diagnostics is not None:
+        history_keys.extend(sorted(set(diagnostics) - set(history_keys)))
+    document = {
         "summary": {
             "pantheon_telemetry/contract_version": TELEMETRY_CONTRACT_VERSION,
             "pantheon_telemetry/heartbeat_at": float(time.time() if heartbeat_at is None else heartbeat_at),
@@ -279,6 +283,55 @@ def telemetry_snapshot_document(
         },
         "provenance": dict(provenance),
     }
+    if diagnostics is not None:
+        document["diagnostics"] = dict(diagnostics)
+    return document
+
+
+def read_cgroup_memory_metrics(root: str | Path = "/sys/fs/cgroup") -> dict[str, int]:
+    """Read pod-level cgroup-v2 memory counters without failing training.
+
+    Pantheon enforces the requested memory as a hard cgroup limit. Anonymous
+    memory and ``memory.events`` are therefore more useful for sizing than
+    ``memory.current``, which also contains reclaimable file cache.
+    """
+
+    root = Path(root)
+
+    def read_integer(name: str) -> int | None:
+        try:
+            value = (root / name).read_text(encoding="utf-8").strip()
+            return int(value) if value != "max" else None
+        except (FileNotFoundError, OSError, ValueError):
+            return None
+
+    metrics: dict[str, int] = {}
+    current = read_integer("memory.current")
+    limit = read_integer("memory.max")
+    if current is not None:
+        metrics["system/cgroup_memory_current_bytes"] = current
+    if limit is not None:
+        metrics["system/cgroup_memory_limit_bytes"] = limit
+
+    for filename, prefix, allowed in (
+        ("memory.stat", "system/cgroup_memory", {"anon", "file"}),
+        ("memory.events", "system/cgroup_memory_events", {"high", "max", "oom", "oom_kill"}),
+    ):
+        try:
+            lines = (root / filename).read_text(encoding="utf-8").splitlines()
+        except (FileNotFoundError, OSError):
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) != 2 or fields[0] not in allowed:
+                continue
+            try:
+                value = int(fields[1])
+            except ValueError:
+                continue
+            suffix = "_bytes" if filename == "memory.stat" else ""
+            metrics[f"{prefix}_{fields[0]}{suffix}"] = value
+    return metrics
 
 
 def validate_telemetry_snapshot_document(

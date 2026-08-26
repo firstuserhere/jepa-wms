@@ -24,7 +24,8 @@ The intended order is:
 5. Qualify the released DROID checkpoint through rollout and planning on the
    same 4-node x 8-GPU topology used for matched training.
 6. Run the two-node, 1% DROID gradient/save/recovery smoke.
-7. Submit matched training on 4 nodes x 8 H200.
+7. Run at least two short MFU boxes on one node x 8 H200 and inspect W&B.
+8. Submit matched training on 4 nodes x 8 H200 only after that gate passes.
 
 ## Current SkyPilot environment: Kubernetes H200 pool
 
@@ -32,8 +33,8 @@ The connected Enterprise API currently exposes Kubernetes compute in the
 `default`, `cpu`, and `fellows` workspaces; it does not expose GCP compute.
 The `Skypilot` Kubernetes context advertises H200 nodes with 1/2/4/8 GPUs per
 node and 128 H200s total. Availability is dynamic (the read-only check on
-2026-08-15 reported zero free), so the default explicit `p1` launch priority is what
-queues/bids for capacity. Do not use the GCP profile below unless `sky check`
+2026-08-15 reported zero free). Launchers default to `p3`; a higher scheduling
+priority is an explicit per-run operator decision. Do not use the GCP profile below unless `sky check`
 later confirms GCP in the selected workspace.
 
 Kubernetes managed recovery needs durable RWX PVCs. In the current default
@@ -64,6 +65,7 @@ DINOV3_SHA256=FULL_64_HEX_SHA256
 QUALIFICATION_RUN_ID=released-droid-qualification-001
 DISTRIBUTED_SMOKE_RUN_ID=cross-node-recovery-smoke-001
 TRAIN_SMOKE_RUN_ID=droid-training-recovery-smoke-001
+MFU_BOX_RUN_ID=droid-dinov3-mfu-box-001
 
 infra/skypilot/launch_k8s.sh stage \
   --droid-volume "$DROID_VOLUME" \
@@ -93,6 +95,13 @@ infra/skypilot/launch_k8s.sh qualify \
 infra/skypilot/launch_k8s.sh train-smoke \
   --run-id "$TRAIN_SMOKE_RUN_ID" \
   --distributed-smoke-run-id "$DISTRIBUTED_SMOKE_RUN_ID" \
+  --droid-volume "$DROID_VOLUME" \
+  --checkpoint-volume "$CHECKPOINT_VOLUME" \
+  --dinov3-weights-sha256 "$DINOV3_SHA256" \
+  --git-url "$GIT_URL" --git-ref "$GIT_REF" --workspace "$SKY_WORKSPACE"
+
+infra/skypilot/launch_k8s.sh mfu-box \
+  --run-id "$MFU_BOX_RUN_ID" \
   --droid-volume "$DROID_VOLUME" \
   --checkpoint-volume "$CHECKPOINT_VOLUME" \
   --dinov3-weights-sha256 "$DINOV3_SHA256" \
@@ -193,9 +202,9 @@ commit and clean; schema-v2 checkpoints then embed the commit, status, complete
 dirty patch (empty for these clean launches), and patch checksum.
 
 Every actual submission contains an explicit CLI priority. The launcher defaults
-to `--priority p1` (the case-sensitive spelling in this SkyPilot Enterprise
-workspace), which can displace `p2` work. Escalation is deliberate via
-`--priority p0`; the YAML files contain no hidden priority setting. `HF_TOKEN` and
+to `--priority p3` (the case-sensitive spelling in this SkyPilot Enterprise
+workspace). A `p0`, `p1`, or `p2` launch requires a fresh explicit decision; the
+YAML files contain no hidden priority setting. `HF_TOKEN` and
 `WANDB_API_KEY` are managed SkyPilot secret references; this bundle never
 accepts their values on the command line. The Hugging Face identity behind
 `HF_TOKEN` must already have accepted the DINOv3 license.
@@ -285,14 +294,25 @@ reports episode success, so DROID `best_planning` correctly minimizes XYZ goal
 endpoint error and reports the corresponding DROID Action Score; simulator
 tasks use actual episode success.
 
-Every distributed smoke, training smoke, qualification, and full-training task
-requires `--run-id NAME`. The renderer sets `EXPERIMENT_TAG`, `WANDB_RUN_ID`,
+Every distributed smoke, training smoke, MFU box, qualification, and
+full-training task requires `--run-id NAME`. The renderer sets
+`EXPERIMENT_TAG`, `WANDB_RUN_ID`,
 and the durable root from that exact value; the worker fails if
 `JEPAWM_RUN_ID != EXPERIMENT_TAG`. Managed recovery therefore reuses the exact
 log, checkpoint, receipt, and W&B identity.
 To intentionally continue an existing named run, add both `--run-id NAME` and
 `--resume`; without that explicit opt-in, an existing or ambiguously populated
 run directory is rejected before training.
+
+`mfu-box` is a real one-node 8xH200 training run, not a synthetic benchmark. It
+inherits the matched DROID/DINOv3 model and per-GPU batch, executes 96 optimizer
+updates in two short epochs, saves only at both epoch boundaries, and disables
+rollout/planning promotion so its checkpoints cannot enter the scientific
+lineage. Rank zero streams the complete W&B training-v1 contract and W&B system
+monitoring samples every five seconds. At completion it publishes the checked
+`run_metadata/MFU_BOX.json`. Run two distinct IDs and require both to pass the
+machine gate plus a visual all-eight-GPU W&B utilization review before using
+the 4-node full task.
 
 Managed recovery restarts the entire gang if a node is preempted. The
 distributed smoke deliberately exits once with code 42, then verifies that

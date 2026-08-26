@@ -86,6 +86,7 @@ from src.utils.training_telemetry import (
     MFU_FORMULA_ID,
     MFU_FORMULA_VERSION,
     PantheonWandbHeartbeat,
+    read_cgroup_memory_metrics,
     telemetry_provenance,
     telemetry_snapshot_document,
 )
@@ -687,6 +688,7 @@ def main(args, resume_preempt=False):
                     resume="allow",
                     dir=folder,
                     config=convert_to_dict_recursive(args),
+                    settings=wandb.Settings(x_stats_sampling_interval=5.0),
                 )
                 self.wandb_run_id = wandb_run_id
                 if os.path.exists(wandb_run_id_file):
@@ -1513,7 +1515,10 @@ def main(args, resume_preempt=False):
         mfu_accumulator = None
         pantheon_heartbeat = None
         latest_mfu_snapshot = None
+        latest_mfu_diagnostics = None
         telemetry_provenance_record = None
+        previous_mfu_model_flops = 0.0
+        previous_mfu_elapsed_s = 0.0
         validation_has_started = False
         if mfu_enabled and not light_eval_only_mode:
             mfu_accumulator = EffectiveMFUAccumulator(
@@ -2071,7 +2076,9 @@ def main(args, resume_preempt=False):
 
                 # In train mode, image_stats is empty
                 if not light_eval_only_mode:
+                    batch_wait_started = time.monotonic()
                     obs, action, state, reward, masks_enc, masks_pred = get_batch()
+                    batch_wait_time_s = max(0.0, time.monotonic() - batch_wait_started)
                     measure_mfu_step = (
                         mfu_enabled
                         and measured_training_flops_per_sample is None
@@ -2178,13 +2185,43 @@ def main(args, resume_preempt=False):
                 ):
                     local_step_time_s = max(1e-9, time.monotonic() - itr_start_time)
                     local_elapsed_e2e_s = max(1e-9, time.monotonic() - training_wall_started)
+                    local_gpu_region_s = max(0.0, gpu_etime_ms / 1000.0)
+                    local_non_gpu_step_s = max(0.0, local_step_time_s - local_gpu_region_s)
+                    local_gpu_region_fraction = min(
+                        1.0, local_gpu_region_s / local_step_time_s
+                    )
+                    local_batch_wait_fraction = min(
+                        1.0, batch_wait_time_s / local_step_time_s
+                    )
                     timing = torch.tensor(
-                        [local_step_time_s, local_elapsed_e2e_s],
+                        [
+                            local_step_time_s,
+                            local_elapsed_e2e_s,
+                            local_gpu_region_s,
+                            batch_wait_time_s,
+                            local_non_gpu_step_s,
+                            float(torch.cuda.max_memory_allocated()),
+                            float(torch.cuda.max_memory_reserved()),
+                        ],
+                        dtype=torch.float64,
+                        device=device,
+                    )
+                    worst_rank_fractions = torch.tensor(
+                        [local_gpu_region_fraction, local_batch_wait_fraction],
                         dtype=torch.float64,
                         device=device,
                     )
                     if torch.distributed.is_available() and torch.distributed.is_initialized():
                         torch.distributed.all_reduce(timing, op=torch.distributed.ReduceOp.MAX)
+                        # The slowest input path and least compute-active rank
+                        # are the useful scale-up diagnostics. Do not average
+                        # away a straggler that will dominate multi-node DDP.
+                        torch.distributed.all_reduce(
+                            worst_rank_fractions[0], op=torch.distributed.ReduceOp.MIN
+                        )
+                        torch.distributed.all_reduce(
+                            worst_rank_fractions[1], op=torch.distributed.ReduceOp.MAX
+                        )
                     latest_mfu_snapshot = mfu_accumulator.snapshot(
                         active_step=epoch * ipe + itr + 1,
                         step_time_s=float(timing[0].item()),
@@ -2192,6 +2229,37 @@ def main(args, resume_preempt=False):
                         timed_wall_coverage=1.0,
                     )
                     total_stats.update(latest_mfu_snapshot.history())
+                    if measured_training_flops_per_sample is not None:
+                        # Until the representative operator profile exists,
+                        # keep the window origin at allocation start. This
+                        # prevents the first profiled sample from charging all
+                        # warmup work to only one step of wall time.
+                        window_flops = latest_mfu_snapshot.model_flops - previous_mfu_model_flops
+                        window_elapsed_s = latest_mfu_snapshot.elapsed_e2e_s - previous_mfu_elapsed_s
+                        window_mfu = (
+                            window_flops
+                            / (window_elapsed_s * world_size * mfu_peak_dense_tflops * 1e12)
+                            if window_elapsed_s > 0
+                            else 0.0
+                        )
+                        previous_mfu_model_flops = latest_mfu_snapshot.model_flops
+                        previous_mfu_elapsed_s = latest_mfu_snapshot.elapsed_e2e_s
+                    else:
+                        window_mfu = 0.0
+                    latest_mfu_diagnostics = {
+                        "perf/effective_mfu_window": window_mfu,
+                        "perf/step_time_s": float(timing[0].item()),
+                        "perf/train_gpu_region_s": float(timing[2].item()),
+                        "perf/batch_wait_s": float(timing[3].item()),
+                        "perf/non_gpu_step_s": float(timing[4].item()),
+                        "perf/gpu_train_region_fraction": float(worst_rank_fractions[0].item()),
+                        "perf/batch_wait_fraction": float(worst_rank_fractions[1].item()),
+                        "system/cuda_max_memory_allocated_bytes": int(timing[5].item()),
+                        "system/cuda_max_memory_reserved_bytes": int(timing[6].item()),
+                    }
+                    if rank == 0:
+                        latest_mfu_diagnostics.update(read_cgroup_memory_metrics())
+                    total_stats.update(latest_mfu_diagnostics)
                     if rank == 0 and pantheon_heartbeat is not None:
                         pantheon_heartbeat.update(latest_mfu_snapshot)
 
@@ -2327,6 +2395,7 @@ def main(args, resume_preempt=False):
                             wandb_url=wandb.run.url,
                             provenance=telemetry_provenance_record,
                             validation_started=validation_has_started,
+                            diagnostics=latest_mfu_diagnostics,
                         )
                         telemetry_directory = os.path.join(checkpoint_folder, "run_metadata")
                         atomic_json_dump(

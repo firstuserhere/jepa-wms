@@ -4,6 +4,7 @@ from src.utils.training_telemetry import (
     EffectiveMFUAccumulator,
     PantheonWandbHeartbeat,
     TELEMETRY_CONTRACT_VERSION,
+    read_cgroup_memory_metrics,
     telemetry_provenance,
     telemetry_snapshot_document,
     validate_telemetry_snapshot_document,
@@ -99,6 +100,7 @@ def test_snapshot_contains_independently_recomputable_raw_terms():
         wandb_url=run.url,
         provenance=provenance,
         validation_started=True,
+        diagnostics={"perf/effective_mfu_window": 0.3},
         heartbeat_at=1234.5,
     )
 
@@ -109,8 +111,33 @@ def test_snapshot_contains_independently_recomputable_raw_terms():
     assert recomputed == pytest.approx(0.25)
     assert "train/loss" in document["history_keys"]
     assert "val/loss" in document["history_keys"]
+    assert document["diagnostics"]["perf/effective_mfu_window"] == 0.3
     validate_telemetry_snapshot_document(document, expected_active_step=1, now=1234.5)
 
     document["mfu_terms"]["useful_flops_by_precision"]["bf16"] *= 2
     with pytest.raises(ValueError, match="does not match"):
         validate_telemetry_snapshot_document(document, expected_active_step=1, now=1234.5)
+
+
+def test_cgroup_memory_metrics_use_anon_and_events(tmp_path):
+    (tmp_path / "memory.current").write_text("1200\n", encoding="utf-8")
+    (tmp_path / "memory.max").write_text("2400\n", encoding="utf-8")
+    (tmp_path / "memory.stat").write_text("anon 700\nfile 400\nkernel 100\n", encoding="utf-8")
+    (tmp_path / "memory.events").write_text(
+        "low 0\nhigh 2\nmax 3\noom 1\noom_kill 1\n", encoding="utf-8"
+    )
+
+    assert read_cgroup_memory_metrics(tmp_path) == {
+        "system/cgroup_memory_current_bytes": 1200,
+        "system/cgroup_memory_limit_bytes": 2400,
+        "system/cgroup_memory_anon_bytes": 700,
+        "system/cgroup_memory_file_bytes": 400,
+        "system/cgroup_memory_events_high": 2,
+        "system/cgroup_memory_events_max": 3,
+        "system/cgroup_memory_events_oom": 1,
+        "system/cgroup_memory_events_oom_kill": 1,
+    }
+
+
+def test_missing_cgroup_files_are_nonfatal(tmp_path):
+    assert read_cgroup_memory_metrics(tmp_path) == {}

@@ -1,0 +1,40 @@
+# Short, observational performance box for the exact matched DROID training
+# path. This is not a scientific baseline and its checkpoints must never be
+# promoted into the released-comparison lineage.
+base_config: droid_dinov3_quality_overlay.yaml
+
+overrides:
+  checkpointing:
+    keep_recent: 2
+    rollout_promotion:
+      enabled: false
+  data:
+    loader:
+      # Preserve the full-run per-GPU batch and worker count on one full node.
+      batch_size: 8
+      num_workers: 16
+      persistent_workers: false
+  meta:
+    quick_debug: false
+    eval_freq: 1000000
+    light_eval_freq: 1000000
+    save_every_freq: 1
+    data_traj_rollout_eval:
+      do_data_traj_rollout_eval: false
+  optimization:
+    transition_model:
+      # Two short epoch-boundary windows: enough post-warmup samples for a
+      # stable MFU diagnosis while keeping each box comfortably under 5 min.
+      iterations_per_epoch: 48
+      num_epochs: 2
+      warmup: 0
+  logging:
+    mfu:
+      telemetry_interval_steps: 1
+      heartbeat_interval_seconds: 10
+    wandb:
+      group: droid-dinov3-jepawm-mfu-box
+      tags: [droid, dinov3-vitl16, jepa-wm, pantheon-h200, mfu-box, single-node]
+  evals:
+    separate: false
+    eval_cfg_paths: []

@@ -18,12 +18,14 @@ TASK_FILES = (
     "distributed_smoke.yaml",
     "droid_stage.yaml",
     "droid_train_smoke.yaml",
+    "droid_train_mfu_box.yaml",
     "droid_qualify_released.yaml",
     "droid_train_full.yaml",
 )
 TRAINING_TASKS = (
     "distributed_smoke.yaml",
     "droid_train_smoke.yaml",
+    "droid_train_mfu_box.yaml",
     "droid_qualify_released.yaml",
     "droid_train_full.yaml",
 )
@@ -124,6 +126,15 @@ def validate_tasks() -> None:
     if "runtime_readiness.py publish" not in smoke_run:
         raise AssertionError("Training smoke must publish the combined runtime-readiness receipt")
 
+    mfu_box = yaml.safe_load(
+        (INFRA_DIR / "droid_train_mfu_box.yaml").read_text(encoding="utf-8")
+    )
+    if mfu_box.get("num_nodes") != 1 or mfu_box["resources"].get("accelerators") != "H200:8":
+        raise AssertionError("MFU box must use exactly one full 8xH200 node")
+    box_run = mfu_box.get("run", "")
+    if "droid_dinov3_mfu_box_overlay.yaml" not in box_run or "mfu_box_report.py" not in box_run:
+        raise AssertionError("MFU box must run the real training path and publish MFU_BOX.json")
+
     qualify = yaml.safe_load((INFRA_DIR / "droid_qualify_released.yaml").read_text(encoding="utf-8"))
     qualify_run = qualify["run"]
     if "9b9c41ef249466630dbf1a20e78391865d07b3b9" not in qualify_run:
@@ -157,7 +168,8 @@ def validate_kubernetes_profile() -> None:
             ),
             context="Skypilot",
             experiment_tag=f"preflight-{filename.removesuffix('.yaml')}",
-            training=filename in {"droid_train_smoke.yaml", "droid_train_full.yaml"},
+            training=filename
+            in {"droid_train_smoke.yaml", "droid_train_mfu_box.yaml", "droid_train_full.yaml"},
         )
         if "infra" in rendered["resources"] or "disk_size" in rendered["resources"]:
             raise AssertionError(f"{filename}: rendered Pantheon task retained forbidden resources")
@@ -278,6 +290,16 @@ def validate_overlays() -> None:
         raise AssertionError("Quality outputs must be isolated by JEPAWM_RUN_ID")
 
     load_config(INFRA_DIR / "droid_dinov3_smoke_overlay.yaml")
+    box = load_config(INFRA_DIR / "droid_dinov3_mfu_box_overlay.yaml")
+    box_schedule = box["optimization"]["transition_model"]
+    if box_schedule.get("iterations_per_epoch") != 48 or box_schedule.get("num_epochs") != 2:
+        raise AssertionError("MFU box must remain a bounded 96-update, two-boundary run")
+    if box["data"]["loader"].get("batch_size") != 8 or box["data"]["loader"].get("num_workers") != 16:
+        raise AssertionError("MFU box must preserve the full-run per-GPU input pipeline")
+    if box["checkpointing"]["rollout_promotion"].get("enabled") is not False:
+        raise AssertionError("Observational MFU-box checkpoints must not enter scientific lineage")
+    if box.get("evals", {}).get("eval_cfg_paths") != []:
+        raise AssertionError("MFU box must contain no planning workload")
     released_rollout = load_config(INFRA_DIR / "released_rollout_overlay.yaml")
     released_planning = load_config(INFRA_DIR / "released_planning_overlay.yaml")
     if released_rollout["meta"].get("rollout_only_eval_mode") is not True:
@@ -302,16 +324,16 @@ def validate_local_syntax() -> None:
             "Distributed smoke setup must install pinned NumPy for torch all_gather_object"
         )
     launch_text = (INFRA_DIR / "launch.sh").read_text(encoding="utf-8")
-    if 'priority_class="p1"' not in launch_text:
-        raise AssertionError("P1 must remain the default launch priority")
+    if 'priority_class="p3"' not in launch_text:
+        raise AssertionError("Pantheon launches must default to p3")
     if '--priority "$priority_class"' not in launch_text:
         raise AssertionError("Launch priority must remain an explicit, validated CLI setting")
     for required_flag in ('--git-url "$git_url"', '--git-ref "$git_ref"', '--workspace "$sky_workspace"'):
         if required_flag not in launch_text:
             raise AssertionError(f"Actual launches must provide {required_flag}")
     k8s_launch_text = (INFRA_DIR / "launch_k8s.sh").read_text(encoding="utf-8")
-    if 'priority_class="p1"' not in k8s_launch_text:
-        raise AssertionError("Kubernetes launches must default to p1")
+    if 'priority_class="p3"' not in k8s_launch_text:
+        raise AssertionError("Kubernetes launches must default to p3")
     if '--priority "$priority_class"' not in k8s_launch_text:
         raise AssertionError("Kubernetes launch priority must be an explicit, validated CLI setting")
     if 'check -w "$sky_workspace" -o json' not in k8s_launch_text:
@@ -340,6 +362,8 @@ def validate_local_syntax() -> None:
             str(INFRA_DIR / "render_k8s_task.py"),
             str(INFRA_DIR / "qualification_receipt.py"),
             str(INFRA_DIR / "runtime_readiness.py"),
+            str(INFRA_DIR / "mfu_box_report.py"),
+            str(REPO_ROOT / "src" / "utils" / "training_telemetry.py"),
             str(REPO_ROOT / "src" / "utils" / "qualification.py"),
             str(REPO_ROOT / "src" / "utils" / "runtime_readiness.py"),
         ],
@@ -359,7 +383,7 @@ def main() -> None:
     if not args.quiet:
         print(
             "Preflight passed: GCP and Kubernetes task profiles, two PVC templates, "
-            "4 overlays, SkyPilot schema, launch invariants, and local syntax."
+            "5 overlays, SkyPilot schema, launch invariants, and local syntax."
         )
         print("No cloud resources, storage, secrets, or jobs were accessed.")
 

@@ -6,7 +6,7 @@ usage() {
   echo "       [--run-id ID [--resume]] [--distributed-smoke-run-id ID]" >&2
   echo "       [--qualification-run-id ID] [--runtime-readiness-run-id ID]" >&2
   echo "       [--git-url URL --git-ref COMMIT] [--priority p0|p1|p2|p3|p4] [--dry-run]" >&2
-  echo "MODE: preflight | stage | stage-prefill | stage-dinov3 | stage-released | distributed-smoke | qualify | train-smoke | full" >&2
+  echo "MODE: preflight | stage | stage-prefill | stage-dinov3 | stage-released | distributed-smoke | qualify | train-smoke | mfu-box | full" >&2
 }
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,7 +31,7 @@ git_url=""
 git_ref=""
 sky_workspace=""
 k8s_context="Skypilot"
-priority_class="p1"
+priority_class="p3"
 while (($#)); do
   case "$1" in
     --droid-volume) droid_volume="${2:-}"; shift 2 ;;
@@ -119,10 +119,11 @@ case "$mode" in
     [[ -n "$checkpoint_volume" ]] || { echo "--checkpoint-volume is required" >&2; exit 2; }
     [[ -n "$run_id" ]] || { echo "distributed-smoke requires --run-id" >&2; exit 2; }
     ;;
-  qualify|train-smoke|full)
+  qualify|train-smoke|mfu-box|full)
     case "$mode" in
       qualify) task_spec=infra/skypilot/droid_qualify_released.yaml ;;
       train-smoke) task_spec=infra/skypilot/droid_train_smoke.yaml ;;
+      mfu-box) task_spec=infra/skypilot/droid_train_mfu_box.yaml ;;
       full) task_spec=infra/skypilot/droid_train_full.yaml ;;
     esac
     [[ -n "$droid_volume" ]] || { echo "--droid-volume is required" >&2; exit 2; }
@@ -162,7 +163,7 @@ render_args=(--input "$task_spec" --output "$rendered_task" --context "$k8s_cont
 [[ -z "$droid_volume" ]] || render_args+=(--droid-volume "$droid_volume")
 [[ -z "$checkpoint_volume" ]] || render_args+=(--checkpoint-volume "$checkpoint_volume")
 [[ -z "$run_id" ]] || render_args+=(--experiment-tag "$run_id")
-if [[ "$mode" == train-smoke || "$mode" == full ]]; then
+if [[ "$mode" == train-smoke || "$mode" == mfu-box || "$mode" == full ]]; then
   render_args+=(--training)
 fi
 "$python_for_sky" infra/skypilot/render_k8s_task.py "${render_args[@]}"
@@ -173,7 +174,7 @@ import sky
 sky.Task.from_yaml(sys.argv[1])
 PY
 
-if [[ "$mode" == train-smoke || "$mode" == full ]]; then
+if [[ "$mode" == train-smoke || "$mode" == mfu-box || "$mode" == full ]]; then
   pantheon_linter="${PANTHEON_GPU_LINTER:-$HOME/.codex/skills/run-pantheon-gpu-jobs/scripts/lint_gpu_job.py}"
   [[ -f "$pantheon_linter" ]] || {
     echo "Pantheon GPU linter is required: set PANTHEON_GPU_LINTER to lint_gpu_job.py" >&2
@@ -225,8 +226,8 @@ launch_env=()
 [[ -z "$runtime_readiness_run_id" ]] || launch_env+=(--env "JEPAWM_RUNTIME_READINESS_RUN_ID=$runtime_readiness_run_id")
 ((resume_requested == 0)) || launch_env+=(--env "JEPAWM_RESUME=1")
 
-# Use p1 first so this run can displace p2 work without taking p0 capacity.
-# Callers may explicitly escalate to p0 if p1 cannot secure enough H200s.
+# Pantheon experiments default to p3. Higher priorities are explicit per-launch
+# decisions; an older escalation request is never treated as standing approval.
 launch_command=(
   "$sky_executable" jobs launch "$rendered_task" --priority "$priority_class" -y -d
   --git-url "$git_url" --git-ref "$git_ref" --workspace "$sky_workspace"

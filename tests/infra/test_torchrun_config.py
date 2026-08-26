@@ -162,6 +162,20 @@ def test_quality_training_keeps_planning_outside_the_gpu_allocation():
     assert resolved["checkpointing"]["max_epoch_boundary_seconds"] == 300
 
 
+def test_single_node_mfu_box_preserves_real_training_path_and_is_bounded():
+    resolved = load_config(REPO_ROOT / "infra/skypilot/droid_dinov3_mfu_box_overlay.yaml")
+
+    assert resolved["model"]["visual_encoder"]["enc_version"] == "dinov3_vitl16"
+    assert resolved["model"]["predictor"]["pred_depth"] == 12
+    assert resolved["data"]["loader"]["batch_size"] == 8
+    assert resolved["data"]["loader"]["num_workers"] == 16
+    assert resolved["optimization"]["transition_model"]["iterations_per_epoch"] == 48
+    assert resolved["optimization"]["transition_model"]["num_epochs"] == 2
+    assert resolved["checkpointing"]["epoch_boundary_only"] is True
+    assert resolved["checkpointing"]["rollout_promotion"]["enabled"] is False
+    assert resolved["evals"]["eval_cfg_paths"] == []
+
+
 def test_full_task_requires_verified_released_qualification_before_torchrun():
     import yaml
 

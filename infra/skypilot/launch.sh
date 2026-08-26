@@ -33,7 +33,7 @@ dry_run=0
 git_url=""
 git_ref=""
 sky_workspace=""
-priority_class="p1"
+priority_class="p3"
 while (($#)); do
   case "$1" in
     --checkpoint-store)
@@ -274,7 +274,8 @@ if [[ ! -x "$sky_executable" ]]; then
 fi
 
 # Priority intentionally remains a launch-time setting rather than being
-# hidden in task YAML. Use p1 first; callers may explicitly escalate to p0.
+# hidden in task YAML. Pantheon experiments default to p3; any escalation is
+# an explicit per-launch decision.
 exec "$sky_executable" jobs launch "$task_spec" --priority "$priority_class" \
   --git-url "$git_url" --git-ref "$git_ref" --workspace "$sky_workspace" \
   "${launch_env[@]}"

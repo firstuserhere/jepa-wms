@@ -23,7 +23,8 @@ artifacts does. Obtain explicit authorization for the exact operation.
 
 Priority is a scheduling policy, not a performance hyperparameter:
 
-- use the explicitly approved `p0`-`p4` value on the CLI;
+- default experiments to `p3`; use a higher `p0`-`p2` value only when it is
+  explicitly approved for that launch;
 - the spelling is lowercase in this Sky installation;
 - do not encode priority inside research YAML;
 - never infer ongoing p0 permission from an earlier run.
@@ -76,11 +77,25 @@ The expensive run is gated in this order:
 4. Complete released-checkpoint qualification and `QUALIFIED.json`.
 5. Real DROID gradient/checkpoint/restart/resume smoke and
    `RUNTIME_READY.json`.
-6. Full matched training.
+6. Repeated one-node 8xH200 MFU boxes on the exact DROID training path.
+7. Full matched training only after the performance gate passes.
+
+The single-node performance gate is deliberately separate from scientific
+qualification. Each box runs 96 real optimizer updates as two 48-update epochs,
+publishes both epoch-boundary checkpoints, streams W&B system metrics at five
+seconds, and writes `run_metadata/MFU_BOX.json`. A box is a scale candidate only
+when it completes, has no cgroup OOM kill, has at least 30% cumulative
+end-to-end effective MFU, at least 40% in its final post-warmup window, spends
+at least 80% of the slowest rank's step in the CUDA training region, and no
+rank waits more than 10% of its step for input. Review W&B's sampled utilization
+for all eight GPUs as an additional human gate. Require two successful boxes
+with consistent step time before allocating 32 GPUs; do not promote box
+checkpoints into the scientific lineage.
 
 Jobs 8448 and 8451 completed steps 2 and 3 for source `8be8f4f...`. Job 8529
 partially completed step 4 on source `caf0623...`; it did not publish the
-combined receipt. Steps 4-6 remain blocked.
+combined receipt. Steps 4-7 remain blocked until their corresponding evidence
+exists.
 
 ## Safe status commands
 
